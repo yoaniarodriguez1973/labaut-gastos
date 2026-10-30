@@ -1,5 +1,5 @@
 // Service worker: red primero (siempre la última versión) y caché como respaldo.
-const CACHE = 'labaut-v1';
+const CACHE = 'labaut-v2';
 const ASSETS = ['./', './index.html', './styles.css', './js/app.js', './js/config.js',
   './manifest.webmanifest', './icons/icon.svg'];
 
