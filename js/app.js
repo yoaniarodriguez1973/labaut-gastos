@@ -1,5 +1,5 @@
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
-import { SUPABASE_URL, SUPABASE_KEY, CATEGORIES, FAMILY_SIZE, PALETTE } from './config.js';
+import { SUPABASE_URL, SUPABASE_KEY, CATEGORIES as DEFAULT_CATEGORIES, FAMILY_SIZE, PALETTE } from './config.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
@@ -20,6 +20,7 @@ const state = {
   expenses: [],
   contributions: [],
   allowed: [],
+  categories: [],
   month: monthOf(todayStr()),
   filters: { member: 'all', category: 'all' },
   charts: [],
@@ -59,7 +60,15 @@ const money = (v) => fmtUYU.format(Number(v) || 0);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const sum = (arr, f) => arr.reduce((a, x) => a + (Number(f(x)) || 0), 0);
 const round2 = (n) => Math.round(n * 100) / 100;
-const cat = (id) => CATEGORIES.find((c) => c.id === id) || { id, icon: '📦', color: '#9A8C98' };
+// Categorías: vienen de la tabla "categories"; si todavía no existe, se usan las de config.js
+const allCats = () => (state.categories.length ? state.categories
+  : DEFAULT_CATEGORIES.map((c, i) => ({ ...c, active: true, sort: (i + 1) * 10 })));
+const activeCats = () => allCats().filter((c) => c.active);
+const cat = (id) => allCats().find((c) => c.id === id) || { id, icon: '📦', color: '#9A8C98', active: false };
+const CAT_ICONS = ['🏠', '💧', '💡', '🔥', '🛒', '🥩', '🥬', '📦', '🌐', '📱', '💊', '🏥', '🚌', '⛽', '🚗', '🎓',
+  '📚', '👕', '🐶', '🎉', '🍽️', '☕', '🍞', '🥛', '🍎', '🧴', '🧹', '🔧', '💳', '🎁', '✈️', '🎬'];
+const CAT_COLORS = ['#3D405B', '#4EA8DE', '#E9B949', '#E76F51', '#81B29A', '#B5394B', '#6A994E', '#9A8C98',
+  '#9B5DE5', '#F15BB5', '#2A9D8F', '#174E5A'];
 const member = (id) => state.members.find((m) => m.id === id) || { name: '¿?', color: '#999999' };
 const initials = (name) => (name || '?').trim().charAt(0).toUpperCase();
 const isOpen = (m) => !state.months.find((x) => x.id === m)?.closed;
@@ -128,6 +137,11 @@ async function loadData() {
   ]);
   Object.assign(state, { members, months, expenses, contributions });
   state.me = members.find((m) => m.id === state.session?.user?.id) || null;
+  // Si la tabla de categorías no existe todavía, allCats() usa las de config.js
+  const { data: cats, error: catErr } = await sb.from('categories').select('*')
+    .order('sort', { ascending: true }).order('name', { ascending: true });
+  state.categories = catErr ? [] : (cats || []).map((c) => ({ id: c.name, icon: c.icon, color: c.color, sort: c.sort, active: c.active }));
+  if (state.filters.category !== 'all' && !allCats().some((c) => c.id === state.filters.category)) state.filters.category = 'all';
   if (state.me?.is_admin) {
     const { data } = await sb.from('allowed_emails').select('*').order('name');
     state.allowed = data || [];
@@ -211,7 +225,7 @@ let reloadTimer = null;
 function subscribeRealtime() {
   if (channel) return;
   channel = sb.channel('familia-labaut');
-  ['expenses', 'contributions', 'months', 'members'].forEach((table) =>
+  ['expenses', 'contributions', 'months', 'members', 'categories'].forEach((table) =>
     channel.on('postgres_changes', { event: '*', schema: 'public', table }, queueReload));
   channel.subscribe();
 }
@@ -445,7 +459,7 @@ function expenseItem(e) {
   const c = cat(e.category);
   const m = member(e.created_by);
   return `<li class="item tap" data-id="${e.id}">
-    <div class="ico" style="background:${c.color}22;color:${c.color}">${c.icon}</div>
+    <div class="ico" style="background:${c.color}22;color:${c.color}">${esc(c.icon)}</div>
     <div class="info">
       <b>${esc(e.note || e.category)}</b>
       <small><span class="dot" style="background:${m.color}"></span>${esc(m.name)} · ${fmtDate(e.spent_on)}${e.receipt_path ? ' · 📎' : ''}</small>
@@ -495,7 +509,7 @@ function viewHome() {
     <section class="card">
       <div class="card-title"><h2>Por categoría</h2><a href="#/analisis">Ver análisis ›</a></div>
       ${byCat.length
-        ? byCat.map(([k, v]) => `<div class="bar-row"><span>${cat(k).icon} ${esc(k)}</span><div class="bar"><i style="width:${(v / maxCat) * 100}%;background:${cat(k).color}"></i></div><b>${money(v)}</b></div>`).join('')
+        ? byCat.map(([k, v]) => `<div class="bar-row"><span>${esc(cat(k).icon)} ${esc(k)}</span><div class="bar"><i style="width:${(v / maxCat) * 100}%;background:${cat(k).color}"></i></div><b>${money(v)}</b></div>`).join('')
         : emptyMsg('Todavía no hay gastos este mes.')}
     </section>
     <section class="card">
@@ -518,7 +532,7 @@ async function openExpense(id) {
   const open = isOpen(monthOf(e.spent_on));
   const close = openModal(`
     <div class="detail-head">
-      <div class="ico lg" style="background:${c.color}22;color:${c.color}">${c.icon}</div>
+      <div class="ico lg" style="background:${c.color}22;color:${c.color}">${esc(c.icon)}</div>
       <div><h2>${money(e.amount_uyu)}</h2><small class="muted">${esc(e.category)}</small></div>
     </div>
     <dl class="dl">
@@ -570,6 +584,9 @@ function viewExpenseForm(params) {
   };
   let newPhoto = null;
   let removePhoto = false;
+  // Categorías visibles; si se edita un gasto de una categoría oculta, se muestra igual
+  const formCats = activeCats();
+  if (f.category && !formCats.some((c) => c.id === f.category)) formCats.push(cat(f.category));
 
   view().innerHTML = `
     <form id="expForm" class="form">
@@ -589,7 +606,7 @@ function viewExpenseForm(params) {
 
       <label class="lbl">Categoría</label>
       <div class="cats" id="cats">
-        ${CATEGORIES.map((c) => `<button type="button" class="cat ${f.category === c.id ? 'sel' : ''}" data-cat="${c.id}" style="--c:${c.color}"><span>${c.icon}</span>${c.id}</button>`).join('')}
+        ${formCats.map((c) => `<button type="button" class="cat ${f.category === c.id ? 'sel' : ''}" data-cat="${esc(c.id)}" style="--c:${c.color}"><span>${esc(c.icon)}</span>${esc(c.id)}</button>`).join('')}
       </div>
 
       <label class="lbl" for="spent_on">Fecha</label>
@@ -724,7 +741,7 @@ function viewMovements() {
       </div>
       <select id="fCat">
         <option value="all">Todas las categorías</option>
-        ${CATEGORIES.map((c) => `<option value="${c.id}" ${fc === c.id ? 'selected' : ''}>${c.icon} ${c.id}</option>`).join('')}
+        ${allCats().map((c) => `<option value="${esc(c.id)}" ${fc === c.id ? 'selected' : ''}>${esc(c.icon)} ${esc(c.id)}</option>`).join('')}
       </select>
     </div>
     <div class="total-line">${list.length} gasto${list.length === 1 ? '' : 's'} · <b>${money(sum(list, (e) => e.amount_uyu))}</b></div>
@@ -949,10 +966,10 @@ function viewAnalysis() {
 
   // Alertas y observaciones
   const notes = [];
-  CATEGORIES.forEach((c) => {
+  allCats().forEach((c) => {
     const now = catNow[c.id] || 0, avg = avg3(c.id);
-    if (avg > 0 && now > avg * 1.2) notes.push({ t: 'warn', h: `${c.icon} <b>${c.id}</b> está ${Math.round((now / avg - 1) * 100)}% por encima de su promedio (${money(avg)}).` });
-    else if (!isCurrent && avg > 0 && now < avg * 0.8) notes.push({ t: 'ok', h: `👏 <b>${c.id}</b> bajó ${Math.round((1 - now / avg) * 100)}% respecto a su promedio.` });
+    if (avg > 0 && now > avg * 1.2) notes.push({ t: 'warn', h: `${esc(c.icon)} <b>${esc(c.id)}</b> está ${Math.round((now / avg - 1) * 100)}% por encima de su promedio (${money(avg)}).` });
+    else if (!isCurrent && avg > 0 && now < avg * 0.8) notes.push({ t: 'ok', h: `👏 <b>${esc(c.id)}</b> bajó ${Math.round((1 - now / avg) * 100)}% respecto a su promedio.` });
   });
   const available = s.opening + s.quota * FAMILY_SIZE;
   if (isCurrent && s.quota > 0 && projection > available) {
@@ -990,11 +1007,11 @@ function viewAnalysis() {
       <h2>Comparación por categoría</h2>
       <table class="tbl cmp">
         <tr><th>Categoría</th><th>Este mes</th><th>Anterior</th><th>Prom. 3m</th></tr>
-        ${CATEGORIES.map((c) => {
+        ${allCats().map((c) => {
           const now = catNow[c.id] || 0, p = monthTotal(shiftMonth(m, -1), c.id), a = avg3(c.id);
           if (!now && !p && !a) return '';
           const arrow = p ? (now > p ? '<span class="neg">▲</span>' : now < p ? '<span class="pos">▼</span>' : '') : '';
-          return `<tr><td>${c.icon} ${c.id}</td><td><b>${money(now)}</b> ${arrow}</td><td>${money(p)}</td><td>${money(round2(a))}</td></tr>`;
+          return `<tr><td>${esc(c.icon)} ${esc(c.id)}</td><td><b>${money(now)}</b> ${arrow}</td><td>${money(p)}</td><td>${money(round2(a))}</td></tr>`;
         }).join('')}
       </table>
     </section>
@@ -1009,7 +1026,7 @@ function viewAnalysis() {
         : emptyMsg('Sin datos.')}
     </section>`;
 
-  const catEntries = CATEGORIES.filter((c) => catNow[c.id]);
+  const catEntries = Object.keys(catNow).map(cat);
   makeChart('chCat', {
     type: 'doughnut',
     data: { labels: catEntries.map((c) => `${c.icon} ${c.id}`),
@@ -1060,6 +1077,25 @@ function viewFamily() {
     </section>
 
     ${admin ? `<section class="card">
+      <div class="card-title"><h2>Categorías</h2><button class="link" id="addCat">➕ Nueva</button></div>
+      <p class="muted small">Las ocultas no aparecen al cargar gastos, pero sus gastos viejos se mantienen.</p>
+      <ul class="list">
+        ${allCats().map((c, i, arr) => {
+          const n = state.expenses.filter((e) => e.category === c.id).length;
+          return `<li class="item">
+            <div class="ico" style="background:${c.color}22;color:${c.color}">${esc(c.icon)}</div>
+            <div class="info"><b>${esc(c.id)}</b><small>${n} gasto${n === 1 ? '' : 's'}${c.active ? '' : ' · 🙈 oculta'}</small></div>
+            <div class="order">
+              <button class="x" data-move-cat="${i}" data-dir="-1" ${i === 0 ? 'disabled' : ''} aria-label="Subir">▲</button>
+              <button class="x" data-move-cat="${i}" data-dir="1" ${i === arr.length - 1 ? 'disabled' : ''} aria-label="Bajar">▼</button>
+            </div>
+            <button class="link" data-edit-cat="${i}">Editar</button>
+          </li>`;
+        }).join('')}
+      </ul>
+    </section>` : ''}
+
+    ${admin ? `<section class="card">
       <h2>Emails autorizados</h2>
       <p class="muted small">Solo estos emails pueden crear una cuenta en la app.</p>
       <ul class="list">
@@ -1082,7 +1118,7 @@ function viewFamily() {
     </section>
 
     <button class="btn ghost block" id="logout">Cerrar sesión</button>
-    <p class="muted small center">Labaut · Juntos en casa · v1.0</p>`;
+    <p class="muted small center">Labaut · Juntos en casa · v1.1</p>`;
 
   $('#pName').value = me.name;
   let color = me.color;
@@ -1119,6 +1155,10 @@ function viewFamily() {
     await refresh();
   }));
 
+  $('#addCat')?.addEventListener('click', () => editCategory(null));
+  $$('[data-edit-cat]').forEach((b) => (b.onclick = () => editCategory(allCats()[Number(b.dataset.editCat)])));
+  $$('[data-move-cat]').forEach((b) => (b.onclick = () => moveCategory(Number(b.dataset.moveCat), Number(b.dataset.dir))));
+
   $('#share').onclick = async () => {
     const url = location.origin + location.pathname;
     const text = '🏠❤️ App de gastos de la familia Labaut. Entrá, creá tu cuenta e instalala:';
@@ -1126,6 +1166,109 @@ function viewFamily() {
     else { await navigator.clipboard?.writeText(url); toast('Enlace copiado 📋'); }
   };
   $('#logout').onclick = async () => { await sb.auth.signOut(); };
+}
+
+/* =====================================================================
+   Categorías (solo administradora)
+   ===================================================================== */
+function catsTableReady() {
+  if (state.categories.length) return true;
+  toast('Falta ejecutar supabase/categorias.sql en Supabase', 'err');
+  return false;
+}
+
+function editCategory(c) {
+  if (!catsTableReady()) return;
+  const used = c ? state.expenses.filter((e) => e.category === c.id).length : 0;
+  let icon = c?.icon || '📦';
+  let color = c?.color || CAT_COLORS.find((x) => !allCats().some((k) => k.color === x)) || CAT_COLORS[0];
+  const close = openModal(`<h2>${c ? 'Editar categoría' : 'Nueva categoría'}</h2>
+    <form id="catForm" class="form">
+      <label class="lbl" for="catName">Nombre</label>
+      <input id="catName" type="text" maxlength="30" placeholder="Ej: Internet, Farmacia…" required>
+      <label class="lbl" for="catIcon">Ícono</label>
+      <div class="icon-row">
+        <div class="ico lg" id="catPreview"></div>
+        <input id="catIcon" type="text" maxlength="8" placeholder="Emoji">
+      </div>
+      <div class="emoji-grid" id="catIcons">
+        ${CAT_ICONS.map((x) => `<button type="button" data-icon="${x}">${x}</button>`).join('')}
+      </div>
+      <label class="lbl">Color</label>
+      <div class="palette" id="catColors">
+        ${CAT_COLORS.map((x) => `<button type="button" data-color="${x}" style="background:${x}" aria-label="${x}"></button>`).join('')}
+      </div>
+      ${c ? `<label class="check"><input type="checkbox" id="catActive" ${c.active ? 'checked' : ''}> Visible al cargar gastos</label>` : ''}
+      <button class="btn primary block">${c ? 'Guardar cambios' : '➕ Crear categoría'}</button>
+    </form>
+    ${c ? (used
+      ? `<p class="muted small">Tiene ${used} gasto${used === 1 ? '' : 's'}: no se puede borrar, pero podés ocultarla. Si la renombrás, sus gastos se actualizan solos.</p>`
+      : '<button class="btn danger block" id="catDel">🗑️ Borrar categoría</button>') : ''}`);
+
+  const paint = () => {
+    const p = $('#catPreview');
+    p.textContent = icon;
+    p.style.background = color + '22';
+    p.style.color = color;
+    $$('#catIcons button').forEach((b) => b.classList.toggle('sel', b.dataset.icon === icon));
+    $$('#catColors button').forEach((b) => b.classList.toggle('sel', b.dataset.color === color));
+  };
+  $('#catName').value = c?.id || '';
+  $('#catIcon').value = icon;
+  $('#catIcon').oninput = (ev) => { icon = ev.target.value.trim() || '📦'; paint(); };
+  $('#catIcons').onclick = (ev) => {
+    const b = ev.target.closest('button');
+    if (!b) return;
+    icon = b.dataset.icon;
+    $('#catIcon').value = icon;
+    paint();
+  };
+  $('#catColors').onclick = (ev) => { const b = ev.target.closest('button'); if (b) { color = b.dataset.color; paint(); } };
+  paint();
+
+  $('#catForm').onsubmit = async (ev) => {
+    ev.preventDefault();
+    const name = $('#catName').value.trim().replace(/\s+/g, ' ');
+    if (!name) return toast('Escribí un nombre', 'err');
+    const clash = allCats().find((k) => k.id.toLowerCase() === name.toLowerCase() && k.id !== c?.id);
+    if (clash) return toast(`Ya existe la categoría "${clash.id}"`, 'err');
+    let res;
+    if (c) {
+      res = await sb.from('categories').update({ name, icon, color, active: $('#catActive').checked }).eq('name', c.id).select();
+    } else {
+      const sort = Math.max(0, ...allCats().map((k) => k.sort || 0)) + 10;
+      res = await sb.from('categories').insert({ name, icon, color, sort }).select();
+    }
+    if (res.error) return toast(res.error.code === '23505' ? 'Ya existe una categoría con ese nombre' : friendlyError(res.error), 'err');
+    if (!res.data?.length) return toast('No tenés permiso para cambiar categorías', 'err');
+    close();
+    toast(c ? 'Categoría actualizada ✅' : 'Categoría creada ✅');
+    await refresh();
+  };
+
+  $('#catDel')?.addEventListener('click', async () => {
+    if (!confirm(`¿Borrar la categoría "${c.id}"?`)) return;
+    const { data, error } = await sb.from('categories').delete().eq('name', c.id).select();
+    if (error) return toast(error.code === '23503' ? 'Tiene gastos: no se puede borrar, ocultala.' : friendlyError(error), 'err');
+    if (!data?.length) return toast('No tenés permiso para borrar categorías', 'err');
+    close();
+    toast('Categoría borrada');
+    await refresh();
+  });
+}
+
+async function moveCategory(i, dir) {
+  if (!catsTableReady()) return;
+  const list = [...allCats()];
+  const j = i + dir;
+  if (j < 0 || j >= list.length) return;
+  [list[i], list[j]] = [list[j], list[i]];
+  // Renumerar (10, 20, 30…) y guardar solo las que cambiaron
+  const changes = list.map((c, k) => ({ c, sort: (k + 1) * 10 })).filter((x) => x.c.sort !== x.sort);
+  const results = await Promise.all(changes.map((x) => sb.from('categories').update({ sort: x.sort }).eq('name', x.c.id)));
+  const err = results.find((r) => r.error)?.error;
+  if (err) toast(friendlyError(err), 'err');
+  await refresh();
 }
 
 /* =====================================================================
@@ -1142,7 +1285,7 @@ async function setSession(session) {
     }
   } else {
     unsubscribeRealtime();
-    Object.assign(state, { me: null, members: [], months: [], expenses: [], contributions: [], allowed: [] });
+    Object.assign(state, { me: null, members: [], months: [], expenses: [], contributions: [], allowed: [], categories: [] });
     $('#app').innerHTML = '';
   }
   render();
