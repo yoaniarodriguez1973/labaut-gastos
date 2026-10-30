@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" fill="#FBF3E4"/>
+  <!-- techo -->
+  <path d="M112 246 L200 160 M400 246 L312 160" stroke="#D9714E" stroke-width="28" stroke-linecap="round" fill="none"/>
+  <!-- corazón -->
+  <path d="M256 236 C206 200 178 174 178 140 C178 114 198 96 222 96 C238 96 250 105 256 118 C262 105 274 96 290 96 C314 96 334 114 334 140 C334 174 306 200 256 236 Z"
+        fill="#E59674" stroke="#D9714E" stroke-width="12" stroke-linejoin="round"/>
+  <!-- paredes -->
+  <path d="M146 262 V384 Q146 404 166 404 H346 Q366 404 366 384 V262" stroke="#174E5A" stroke-width="18" fill="none" stroke-linecap="round"/>
+  <!-- brazos unidos -->
+  <path d="M206 306 Q216 334 230 344 M244 350 Q256 360 268 350 M282 344 Q296 334 306 306"
+        stroke="#E8735F" stroke-width="9" stroke-linecap="round" fill="none"/>
+  <!-- padres -->
+  <circle cx="192" cy="270" r="18" fill="#D9714E"/>
+  <rect x="175" y="294" width="34" height="92" rx="15" fill="#D9714E"/>
+  <circle cx="320" cy="270" r="18" fill="#D9714E"/>
+  <rect x="303" y="294" width="34" height="92" rx="15" fill="#D9714E"/>
+  <!-- hijos -->
+  <circle cx="236" cy="320" r="13" fill="#F26B5B"/>
+  <rect x="224" y="338" width="24" height="48" rx="11" fill="#F26B5B"/>
+  <circle cx="276" cy="320" r="13" fill="#F26B5B"/>
+  <rect x="264" y="338" width="24" height="48" rx="11" fill="#F26B5B"/>
+</svg>
