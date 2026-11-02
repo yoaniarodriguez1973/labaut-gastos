@@ -137,6 +137,7 @@ select:disabled { background-color: #F6F2EA; }
 .photo { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
 .photo img, .receipt img { max-width: 100%; max-height: 320px; border-radius: 12px; box-shadow: var(--shadow); }
 .file-btn { cursor: pointer; }
+.photo-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; width: 100%; }
 .check { display: flex; align-items: center; gap: 8px; font-size: .92rem; }
 .palette { display: flex; gap: 10px; flex-wrap: wrap; }
 .palette button { width: 36px; height: 36px; border-radius: 50%; border: 3px solid #fff; box-shadow: 0 0 0 1.5px var(--line); cursor: pointer; }
@@ -149,6 +150,27 @@ select:disabled { background-color: #F6F2EA; }
 .order { display: flex; flex-direction: column; }
 .order .x { font-size: .8rem; padding: 2px 6px; }
 .order .x:disabled { opacity: .25; }
+
+/* ---------- Común / personal / No imputa ---------- */
+.tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 3px; }
+.tag { font-size: .68rem; font-weight: 700; padding: 2px 7px; border-radius: 999px; background: #EEF4F7; color: var(--teal); white-space: nowrap; }
+.tag.personal { background: #F3ECFB; color: #6B3FA0; }
+.tag.excl { background: #FDECEA; color: var(--warn); }
+.strike { text-decoration: line-through; color: var(--muted); }
+.item.excluded .info b, .item.excluded .ico { opacity: .55; }
+.seg a { padding: 8px 18px; border-radius: 999px; font-weight: 700; color: var(--muted); font-size: .95rem; }
+.seg a.sel { background: #fff; color: var(--teal); box-shadow: 0 2px 6px rgba(0,0,0,.08); }
+.tabs { display: flex; margin-bottom: 12px; }
+.tabs a { flex: 1; text-align: center; }
+.scope-seg { display: flex; }
+.scope-seg button { flex: 1; }
+.split-box { background: #fff; border: 1.5px dashed var(--line); border-radius: 13px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.split-box #personalRow { display: flex; flex-direction: column; gap: 6px; }
+.split-box #personalRow.hidden { display: none; }
+.split-preview { font-size: .9rem; }
+.mine-link { color: var(--text); }
+.mine-link span { color: var(--primary-d); font-weight: 700; font-size: .88rem; }
+#fWho { margin-bottom: 12px; }
 
 /* ---------- Botones ---------- */
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 0; border-radius: 14px; padding: 13px 18px;

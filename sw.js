@@ -1,5 +1,5 @@
 // Service worker: red primero (siempre la última versión) y caché como respaldo.
-const CACHE = 'labaut-v2';
+const CACHE = 'labaut-v4';
 const ASSETS = ['./', './index.html', './styles.css', './js/app.js', './js/config.js',
   './manifest.webmanifest', './icons/icon.svg'];
 
@@ -26,5 +26,30 @@ self.addEventListener('fetch', (e) => {
         return res;
       })
       .catch(() => caches.match(e.request).then((r) => r || caches.match('./index.html')))
+  );
+});
+
+// ---------- Notificaciones push ----------
+self.addEventListener('push', (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch { d = { body: e.data ? e.data.text() : '' }; }
+  e.waitUntil(self.registration.showNotification(d.title || 'Labaut', {
+    body: d.body || '',
+    icon: './icons/logo.jpg',
+    badge: './icons/logo.jpg',
+    tag: d.tag,
+    data: { url: d.url || './' },
+  }));
+});
+
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const url = new URL(e.notification.data?.url || './', self.registration.scope).href;
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
+      const c = list.find((w) => w.url.startsWith(self.registration.scope));
+      if (c) return c.focus().then((w) => (w || c).navigate(url)).catch(() => {});
+      return self.clients.openWindow(url);
+    })
   );
 });

@@ -69,6 +69,13 @@ const CAT_ICONS = ['🏠', '💧', '💡', '🔥', '🛒', '🥩', '🥬', '📦
   '📚', '👕', '🐶', '🎉', '🍽️', '☕', '🍞', '🥛', '🍎', '🧴', '🧹', '🔧', '💳', '🎁', '✈️', '🎬'];
 const CAT_COLORS = ['#3D405B', '#4EA8DE', '#E9B949', '#E76F51', '#81B29A', '#B5394B', '#6A994E', '#9A8C98',
   '#9B5DE5', '#F15BB5', '#2A9D8F', '#174E5A'];
+
+// Gastos comunes vs. personales
+const isCommon = (e) => (e.scope || 'comun') === 'comun';
+/** Lo que el gasto suma a la caja común ($UY). Personal o "No imputa" = 0. */
+const sharedUyu = (e) => Number(e.shared_uyu ?? e.amount_uyu) || 0;
+/** La parte personal del gasto ($UY): todo si es personal o "No imputa", o lo descontado del ticket. */
+const personalUyu = (e) => round2((Number(e.amount_uyu) || 0) - sharedUyu(e));
 const member = (id) => state.members.find((m) => m.id === id) || { name: '¿?', color: '#999999' };
 const initials = (name) => (name || '?').trim().charAt(0).toUpperCase();
 const isOpen = (m) => !state.months.find((x) => x.id === m)?.closed;
@@ -153,13 +160,14 @@ async function refresh() {
   render();
 }
 
-/** Cálculos de la caja común para un mes. */
+/** Cálculos de la caja común para un mes (solo gastos comunes; usa lo imputado a la caja). */
 function monthStats(m) {
-  const exps = state.expenses.filter((e) => monthOf(e.spent_on) === m);
+  const common = state.expenses.filter(isCommon);
+  const exps = common.filter((e) => monthOf(e.spent_on) === m);
   const conts = state.contributions.filter((c) => c.month_id === m);
   const opening = sum(state.contributions.filter((c) => c.month_id < m), (c) => c.amount)
-                - sum(state.expenses.filter((e) => monthOf(e.spent_on) < m), (e) => e.amount_uyu);
-  const spent = sum(exps, (e) => e.amount_uyu);
+                - sum(common.filter((e) => monthOf(e.spent_on) < m), sharedUyu);
+  const spent = sum(exps, sharedUyu);
   const contributed = sum(conts, (c) => c.amount);
   const balance = opening + contributed - spent;
   const adjTotal = sum(conts.filter((c) => c.kind === 'ajuste'), (c) => c.amount);
@@ -243,6 +251,103 @@ function queueReload() {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && state.me) queueReload();
 });
+
+/* =====================================================================
+   Notificaciones push
+   ===================================================================== */
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+
+function b64ToBytes(s) {
+  const pad = '='.repeat((4 - (s.length % 4)) % 4);
+  const bin = atob((s + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(bin, (ch) => ch.charCodeAt(0));
+}
+
+async function currentPushSub() {
+  if (!pushSupported()) return null;
+  const reg = await navigator.serviceWorker.ready;
+  return reg.pushManager.getSubscription();
+}
+
+function pushHelp() {
+  if (isIOS() && !isStandalone()) {
+    return `<h2>🔔 Notificaciones en iPhone</h2>
+      <ol class="steps">
+        <li>Primero instalá la app: en <b>Safari</b> tocá <b>Compartir</b> <span class="kbd">⬆️</span> → <b>"Agregar a inicio"</b>.</li>
+        <li>Abrí la app <b>desde el ícono</b> de la pantalla de inicio.</li>
+        <li>Entrá a <b>Familia</b> y tocá <b>"Activar notificaciones"</b>.</li>
+      </ol>
+      <p class="muted small">Necesita iOS 16.4 o más nuevo.</p>`;
+  }
+  return `<h2>🔔 Notificaciones</h2><p>Este navegador no permite notificaciones. En Android usá <b>Chrome</b>; en iPhone, la app instalada desde Safari.</p>`;
+}
+
+async function enablePush() {
+  if (!pushSupported()) { openModal(pushHelp()); return false; }
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') {
+    toast('No se dio permiso. Activalo en la configuración del celular (Notificaciones → Labaut).', 'err');
+    return false;
+  }
+  try {
+    const { data, error } = await sb.functions.invoke('notify', { body: { type: 'key' } });
+    const key = data?.publicKey;
+    if (error || !key) throw new Error('Las notificaciones todavía no están configuradas en Supabase.');
+    const reg = await navigator.serviceWorker.ready;
+    const opts = { userVisibleOnly: true, applicationServerKey: b64ToBytes(key) };
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      sub = await reg.pushManager.subscribe(opts);
+    }
+    let j = sub.toJSON();
+    let { error: e2 } = await sb.from('push_subscriptions').upsert({
+      endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth, user_agent: navigator.userAgent.slice(0, 200),
+    });
+    if (e2) {
+      // Suscripción vieja (otra clave u otra persona en este celular): se renueva
+      await sub.unsubscribe();
+      sub = await reg.pushManager.subscribe(opts);
+      j = sub.toJSON();
+      ({ error: e2 } = await sb.from('push_subscriptions').upsert({
+        endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth, user_agent: navigator.userAgent.slice(0, 200),
+      }));
+      if (e2) throw e2;
+    }
+    toast('🔔 Notificaciones activadas');
+    return true;
+  } catch (err) {
+    toast(friendlyError(err), 'err');
+    return false;
+  }
+}
+
+/** Quita este celular de la lista de avisos (opcionalmente también desuscribe el navegador). */
+async function disablePush(unsubscribe = true) {
+  try {
+    const sub = await currentPushSub();
+    if (!sub) return;
+    await sb.from('push_subscriptions').delete().eq('endpoint', sub.endpoint);
+    if (unsubscribe) await sub.unsubscribe();
+  } catch { /* sin conexión: no importa */ }
+}
+
+/** Pide al servidor que avise a la familia. No bloquea ni muestra errores. */
+function notify(type, id, extra = {}) {
+  sb.functions.invoke('notify', { body: { type, id, ...extra } }).catch(() => {});
+}
+
+function pushBanner() {
+  if (!pushSupported() || Notification.permission !== 'default' || localStorage.getItem('hidePush')) return '';
+  return `<section class="card notice" id="pushBanner">
+    <p>🔔 Activá las notificaciones para enterarte de cada gasto y aporte.</p>
+    <button class="btn primary sm" id="pushBannerOn">Activar</button>
+    <button class="x" id="pushBannerHide" aria-label="Ocultar">×</button>
+  </section>`;
+}
+function bindPushBanner() {
+  $('#pushBannerOn')?.addEventListener('click', async () => { if (await enablePush()) $('#pushBanner')?.remove(); });
+  $('#pushBannerHide')?.addEventListener('click', () => { localStorage.setItem('hidePush', '1'); $('#pushBanner')?.remove(); });
+}
 
 /* =====================================================================
    Instalación (PWA)
@@ -455,16 +560,36 @@ function renderNotMember() {
 /* =====================================================================
    Inicio
    ===================================================================== */
-function expenseItem(e) {
+/**
+ * Fila de un gasto.
+ * mode 'comun': muestra lo que suma a la caja. mode 'mios': muestra el total y cuánto es personal.
+ */
+function expenseItem(e, mode = 'comun') {
   const c = cat(e.category);
   const m = member(e.created_by);
-  return `<li class="item tap" data-id="${e.id}">
+  const total = Number(e.amount_uyu) || 0;
+  const tags = [];
+  if (!isCommon(e)) tags.push('<span class="tag personal">👤 Personal</span>');
+  if (e.excluded) tags.push('<span class="tag excl">🚫 No imputa</span>');
+  if (isCommon(e) && !e.excluded && Number(e.personal_amount) > 0) tags.push(`<span class="tag">👤 ${money(personalUyu(e))} personal</span>`);
+
+  let amt;
+  if (mode === 'mios') {
+    amt = `<b>${money(total)}</b>${isCommon(e) && sharedUyu(e) > 0 ? `<small>caja ${money(sharedUyu(e))}</small>` : ''}`;
+  } else if (e.excluded) {
+    amt = `<b class="strike">${money(total)}</b><small>no imputa</small>`;
+  } else {
+    const sub = Number(e.personal_amount) > 0 ? `ticket ${money(total)}` : (e.currency === 'USD' ? fmtUSD.format(e.amount) : '');
+    amt = `<b>${money(sharedUyu(e))}</b>${sub ? `<small>${sub}</small>` : ''}`;
+  }
+  return `<li class="item tap ${mode === 'comun' && e.excluded ? 'excluded' : ''}" data-id="${e.id}">
     <div class="ico" style="background:${c.color}22;color:${c.color}">${esc(c.icon)}</div>
     <div class="info">
       <b>${esc(e.note || e.category)}</b>
       <small><span class="dot" style="background:${m.color}"></span>${esc(m.name)} · ${fmtDate(e.spent_on)}${e.receipt_path ? ' · 📎' : ''}</small>
+      ${tags.length ? `<div class="tags">${tags.join('')}</div>` : ''}
     </div>
-    <div class="amt"><b>${money(e.amount_uyu)}</b>${e.currency === 'USD' ? `<small>${fmtUSD.format(e.amount)}</small>` : ''}</div>
+    <div class="amt">${amt}</div>
   </li>`;
 }
 function bindExpenseItems() {
@@ -490,10 +615,13 @@ function quotaCard(s) {
 function viewHome() {
   const s = monthStats(state.month);
   const recent = [...s.exps].sort(byDateDesc).slice(0, 5);
-  const byCat = Object.entries(groupSum(s.exps, (e) => e.category, (e) => e.amount_uyu)).sort((a, b) => b[1] - a[1]);
+  const byCat = Object.entries(groupSum(s.exps, (e) => e.category, sharedUyu)).filter((x) => x[1] > 0).sort((a, b) => b[1] - a[1]);
   const maxCat = Math.max(1, ...byCat.map((x) => x[1]));
+  const mineMonth = state.expenses.filter((e) => e.created_by === state.me.id && monthOf(e.spent_on) === s.m);
+  const myPersonal = sum(mineMonth, personalUyu);
   view().innerHTML = `
     ${installBanner()}
+    ${pushBanner()}
     <h1 class="hello">Hola, ${esc(state.me.name)} 👋</h1>
     <section class="card hero ${s.balance < 0 ? 'neg' : ''}">
       <div class="label">Caja común · ${monthLabel(s.m, { month: 'long' })}</div>
@@ -506,6 +634,10 @@ function viewHome() {
       ${s.closed ? '<div class="pill">🔒 Mes cerrado</div>' : ''}
     </section>
     ${quotaCard(s)}
+    <a class="card notice mine-link" href="#/movimientos?vista=mios">
+      <p>👤 Mis gastos personales de ${monthLabel(s.m, { month: 'long' })}: <b>${money(myPersonal)}</b></p>
+      <span>Ver ›</span>
+    </a>
     <section class="card">
       <div class="card-title"><h2>Por categoría</h2><a href="#/analisis">Ver análisis ›</a></div>
       ${byCat.length
@@ -514,9 +646,10 @@ function viewHome() {
     </section>
     <section class="card">
       <div class="card-title"><h2>Últimos gastos</h2><a href="#/movimientos">Ver todos ›</a></div>
-      ${recent.length ? `<ul class="list">${recent.map(expenseItem).join('')}</ul>` : emptyMsg('Tocá ＋ para registrar el primero.')}
+      ${recent.length ? `<ul class="list">${recent.map((e) => expenseItem(e)).join('')}</ul>` : emptyMsg('Tocá ＋ para registrar el primero.')}
     </section>`;
   bindExpenseItems();
+  bindPushBanner();
   $('#quickContrib')?.addEventListener('click', () => addContribution(s));
 }
 
@@ -529,22 +662,54 @@ async function openExpense(id) {
   const c = cat(e.category);
   const m = member(e.created_by);
   const mine = e.created_by === state.me.id;
+  const admin = state.me.is_admin;
   const open = isOpen(monthOf(e.spent_on));
+  const common = isCommon(e);
+  const canModify = mine && (!common || open);   // los personales se pueden tocar aunque el mes esté cerrado
+  const hasSplit = common && Number(e.personal_amount) > 0;
+  const by = e.excluded_by ? member(e.excluded_by).name : '';
   const close = openModal(`
     <div class="detail-head">
       <div class="ico lg" style="background:${c.color}22;color:${c.color}">${esc(c.icon)}</div>
-      <div><h2>${money(e.amount_uyu)}</h2><small class="muted">${esc(e.category)}</small></div>
+      <div><h2>${money(common && !e.excluded ? sharedUyu(e) : e.amount_uyu)}</h2>
+        <small class="muted">${esc(e.category)} · ${common ? '🏠 Común' : '👤 Personal'}</small></div>
     </div>
+    ${e.excluded ? `<div class="alert warn">🚫 <b>No imputa a la caja.</b>${e.excluded_reason ? ' Motivo: ' + esc(e.excluded_reason) + '.' : ''}
+      ${by ? `<br><small>Marcado por ${esc(by)} el ${new Date(e.excluded_at).toLocaleDateString('es-UY')}. Cuenta como gasto personal de ${esc(m.name)}.</small>` : ''}</div>` : ''}
     <dl class="dl">
       ${e.currency === 'USD' ? `<dt>Monto original</dt><dd>${fmtUSD.format(e.amount)} × ${e.rate} $UY</dd>` : ''}
+      ${hasSplit ? `<dt>Total del ticket</dt><dd>${money(e.amount_uyu)}</dd>
+        <dt>Parte personal</dt><dd>${money(personalUyu(e))}${e.excluded ? '' : ` (de ${esc(m.name)})`}</dd>
+        <dt>A la caja</dt><dd><b>${money(sharedUyu(e))}</b></dd>` : ''}
       <dt>Fecha</dt><dd>${fmtDate(e.spent_on, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</dd>
       <dt>Registrado por</dt><dd><span class="dot" style="background:${m.color}"></span>${esc(m.name)}</dd>
       ${e.note ? `<dt>Nota</dt><dd>${esc(e.note)}</dd>` : ''}
     </dl>
     ${e.receipt_path ? '<div class="receipt" id="receiptBox">Cargando ticket…</div>' : ''}
-    ${mine && open ? '<div class="actions"><button class="btn ghost" id="btnEdit">✏️ Editar</button><button class="btn danger" id="btnDel">🗑️ Borrar</button></div>' : ''}
-    ${mine && !open ? '<p class="muted">🔒 El mes está cerrado; no se puede modificar.</p>' : ''}
-    ${!mine ? `<p class="muted small">Solo ${esc(m.name)} puede editar o borrar este gasto.</p>` : ''}`);
+    ${canModify ? '<div class="actions"><button class="btn ghost" id="btnEdit">✏️ Editar</button><button class="btn danger" id="btnDel">🗑️ Borrar</button></div>' : ''}
+    ${mine && !canModify ? '<p class="muted">🔒 El mes está cerrado; no se puede modificar.</p>' : ''}
+    ${!mine ? `<p class="muted small">Solo ${esc(m.name)} puede editar o borrar este gasto.</p>` : ''}
+    ${admin && common && open ? (e.excluded
+      ? '<button class="btn ghost block" id="btnInclude">↩️ Volver a imputar a la caja</button>'
+      : '<button class="btn ghost block" id="btnExclude">🚫 Marcar "No imputa"</button>') : ''}`);
+
+  $('#btnExclude')?.addEventListener('click', async () => {
+    const reason = prompt('¿Por qué no imputa? (opcional)\nEj: "Es un gasto personal"', '');
+    if (reason === null) return;
+    const { error } = await sb.rpc('set_expense_excluded', { p_id: e.id, p_excluded: true, p_reason: reason });
+    if (error) return toast(friendlyError(error), 'err');
+    notify('excluded', e.id);
+    close();
+    toast('Marcado como "No imputa" 🚫');
+    await refresh();
+  });
+  $('#btnInclude')?.addEventListener('click', async () => {
+    const { error } = await sb.rpc('set_expense_excluded', { p_id: e.id, p_excluded: false, p_reason: null });
+    if (error) return toast(friendlyError(error), 'err');
+    close();
+    toast('El gasto vuelve a imputar a la caja ✅');
+    await refresh();
+  });
 
   $('#btnEdit')?.addEventListener('click', () => { close(); go('nuevo?id=' + e.id); });
   $('#btnDel')?.addEventListener('click', async () => {
@@ -581,6 +746,7 @@ function viewExpenseForm(params) {
   const f = {
     amount: e?.amount ?? '', currency: e?.currency ?? 'UYU', rate: e && e.currency === 'USD' ? e.rate : '',
     category: e?.category ?? '', spent_on: e?.spent_on ?? defaultDate(), note: e?.note ?? '',
+    scope: e?.scope ?? 'comun', personal: Number(e?.personal_amount) > 0 ? e.personal_amount : '',
   };
   let newPhoto = null;
   let removePhoto = false;
@@ -604,6 +770,21 @@ function viewExpenseForm(params) {
         </div>
       </div>
 
+      <label class="lbl">¿Es un gasto común o personal?</label>
+      <div class="seg scope-seg" id="scopeSeg">
+        <button type="button" data-scope="comun">🏠 Común</button>
+        <button type="button" data-scope="personal">👤 Personal</button>
+      </div>
+      <small class="muted" id="scopeHelp"></small>
+      ${e?.excluded ? `<div class="alert warn">🚫 La administradora marcó este gasto como <b>No imputa</b>${e.excluded_reason ? ': ' + esc(e.excluded_reason) : ''}.</div>` : ''}
+      <div id="splitBox" class="split-box">
+        <label class="check"><input type="checkbox" id="hasPersonal"> Hay algo personal en este ticket (ej: una cerveza)</label>
+        <div id="personalRow" class="hidden">
+          <input id="personal" type="number" inputmode="decimal" step="0.01" min="0.01" placeholder="¿Cuánto es lo personal?">
+          <div id="splitPreview" class="split-preview"></div>
+        </div>
+      </div>
+
       <label class="lbl">Categoría</label>
       <div class="cats" id="cats">
         ${formCats.map((c) => `<button type="button" class="cat ${f.category === c.id ? 'sel' : ''}" data-cat="${esc(c.id)}" style="--c:${c.color}"><span>${esc(c.icon)}</span>${esc(c.id)}</button>`).join('')}
@@ -617,9 +798,14 @@ function viewExpenseForm(params) {
 
       <label class="lbl">Foto del ticket (opcional)</label>
       <div class="photo">
-        <label class="btn ghost file-btn">📷 ${e?.receipt_path ? 'Cambiar foto' : 'Sacar o elegir foto'}
-          <input type="file" id="photo" accept="image/*" hidden>
-        </label>
+        <div class="photo-btns">
+          <label class="btn ghost file-btn">📷 ${e?.receipt_path ? 'Nueva foto' : 'Sacar foto'}
+            <input type="file" id="photoCam" accept="image/*" capture="environment" hidden>
+          </label>
+          <label class="btn ghost file-btn">🖼️ Galería
+            <input type="file" id="photoGal" accept="image/*" hidden>
+          </label>
+        </div>
         ${e?.receipt_path ? '<button type="button" class="link danger" id="rmPhoto">Quitar foto actual</button>' : ''}
         <div id="photoPreview"></div>
       </div>
@@ -636,7 +822,36 @@ function viewExpenseForm(params) {
   const updatePreview = () => {
     const a = Number($('#amount').value), r = Number($('#rate').value);
     $('#uyuPreview').textContent = f.currency === 'USD' && a > 0 && r > 0 ? `= ${money(round2(a * r))}` : '';
+    updateSplit();
   };
+  // Parte personal dentro de un ticket común
+  const updateSplit = () => {
+    const a = Number($('#amount').value), p = Number($('#personal').value);
+    const r = f.currency === 'USD' ? Number($('#rate').value) || 0 : 1;
+    const box = $('#splitPreview');
+    if (!(a > 0) || !(p > 0)) { box.innerHTML = ''; return; }
+    if (p >= a) { box.innerHTML = '<span class="neg">Lo personal tiene que ser menor que el total. Si es todo personal, elegí 👤 Personal.</span>'; return; }
+    box.innerHTML = `🏠 A la caja: <b>${money(round2((a - p) * r))}</b> · 👤 Personal: <b>${money(round2(p * r))}</b>`;
+  };
+  const setScope = (sc) => {
+    f.scope = sc;
+    $$('#scopeSeg button').forEach((b) => b.classList.toggle('sel', b.dataset.scope === sc));
+    $('#splitBox').classList.toggle('hidden', sc !== 'comun');
+    $('#scopeHelp').textContent = sc === 'comun'
+      ? 'Entra en la caja común y lo ven todos.'
+      : 'Solo para tu control: no toca la caja. Lo ven vos y la administradora.';
+  };
+  $('#scopeSeg').onclick = (ev) => { const b = ev.target.closest('button'); if (b) setScope(b.dataset.scope); };
+  $('#hasPersonal').onchange = (ev) => {
+    $('#personalRow').classList.toggle('hidden', !ev.target.checked);
+    if (ev.target.checked) $('#personal').focus();
+    updateSplit();
+  };
+  $('#personal').oninput = updateSplit;
+  $('#personal').value = f.personal;
+  $('#hasPersonal').checked = !!f.personal;
+  $('#personalRow').classList.toggle('hidden', !f.personal);
+  setScope(f.scope);
   const setCurrency = async (cur) => {
     f.currency = cur;
     $$('#curSeg button').forEach((b) => b.classList.toggle('sel', b.dataset.cur === cur));
@@ -656,7 +871,7 @@ function viewExpenseForm(params) {
     $$('#cats .cat').forEach((x) => x.classList.toggle('sel', x === b));
   };
 
-  $('#photo').onchange = async (ev) => {
+  const onPhoto = async (ev) => {
     const file = ev.target.files?.[0];
     if (!file) return;
     try {
@@ -666,7 +881,10 @@ function viewExpenseForm(params) {
     } catch {
       toast('No se pudo leer la foto', 'err');
     }
+    ev.target.value = ''; // permite volver a elegir la misma foto
   };
+  $('#photoCam').onchange = onPhoto;
+  $('#photoGal').onchange = onPhoto;
   $('#rmPhoto')?.addEventListener('click', (ev) => {
     removePhoto = true; newPhoto = null;
     $('#photoPreview').innerHTML = '<p class="muted small">La foto se quitará al guardar.</p>';
@@ -682,7 +900,10 @@ function viewExpenseForm(params) {
     if (!(rate > 0)) return toast('Ingresá la cotización del dólar', 'err');
     if (!f.category) return toast('Elegí una categoría', 'err');
     if (!spent_on) return toast('Elegí la fecha', 'err');
-    if (!isOpen(monthOf(spent_on))) return toast('Ese mes está cerrado 🔒', 'err');
+    const personal_amount = f.scope === 'comun' && $('#hasPersonal').checked ? round2(Number($('#personal').value) || 0) : 0;
+    if (personal_amount < 0) return toast('La parte personal no puede ser negativa', 'err');
+    if (personal_amount >= amount) return toast('Lo personal tiene que ser menor que el total. Si es todo personal, elegí 👤 Personal.', 'err');
+    if (f.scope === 'comun' && !isOpen(monthOf(spent_on))) return toast('Ese mes está cerrado 🔒 (podés cargarlo como 👤 Personal)', 'err');
 
     const btn = $('#saveBtn');
     btn.disabled = true;
@@ -702,17 +923,18 @@ function viewExpenseForm(params) {
         receipt_path = null;
       }
       const payload = { amount, currency: f.currency, rate, category: f.category, spent_on,
-                        note: $('#note').value.trim() || null, receipt_path };
+                        note: $('#note').value.trim() || null, receipt_path, scope: f.scope, personal_amount };
       const q = e ? sb.from('expenses').update(payload).eq('id', e.id).select()
                   : sb.from('expenses').insert(payload).select();
       const { data, error } = await q;
       if (error) throw error;
       if (!data?.length) throw new Error('permission');
       if (oldToDelete) await sb.storage.from('tickets').remove([oldToDelete]);
+      if (!e && f.scope === 'comun') notify('expense', data[0].id);
       toast(e ? 'Gasto actualizado ✅' : 'Gasto guardado ✅');
       state.month = monthOf(spent_on);
       await loadData();
-      go('movimientos');
+      go(f.scope === 'personal' ? 'movimientos?vista=mios' : 'movimientos');
     } catch (err) {
       if (uploaded) await sb.storage.from('tickets').remove([uploaded]);
       toast(friendlyError(err), 'err');
@@ -725,7 +947,15 @@ function viewExpenseForm(params) {
 /* =====================================================================
    Movimientos
    ===================================================================== */
-function viewMovements() {
+function movTabs(mine, label = 'Mis gastos') {
+  return `<div class="seg tabs">
+    <a href="#/movimientos" class="${mine ? '' : 'sel'}">🏠 Comunes</a>
+    <a href="#/movimientos?vista=mios" class="${mine ? 'sel' : ''}">👤 ${label}</a>
+  </div>`;
+}
+
+function viewMovements(params) {
+  if (params?.get('vista') === 'mios') { viewMine(params); return; }
   const s = monthStats(state.month);
   const { member: fm, category: fc } = state.filters;
   const list = s.exps.filter((e) => (fm === 'all' || e.created_by === fm) && (fc === 'all' || e.category === fc)).sort(byDateDesc);
@@ -734,6 +964,7 @@ function viewMovements() {
 
   view().innerHTML = `
     <h1>Gastos de ${monthLabel(state.month, { month: 'long' })}</h1>
+    ${movTabs(false)}
     <div class="filters">
       <div class="chips" id="fMember">
         <button data-v="all" class="${fm === 'all' ? 'sel' : ''}">Todos</button>
@@ -744,17 +975,62 @@ function viewMovements() {
         ${allCats().map((c) => `<option value="${esc(c.id)}" ${fc === c.id ? 'selected' : ''}>${esc(c.icon)} ${esc(c.id)}</option>`).join('')}
       </select>
     </div>
-    <div class="total-line">${list.length} gasto${list.length === 1 ? '' : 's'} · <b>${money(sum(list, (e) => e.amount_uyu))}</b></div>
+    <div class="total-line">${list.length} gasto${list.length === 1 ? '' : 's'} · a la caja <b>${money(sum(list, sharedUyu))}</b></div>
     ${list.length
       ? Object.entries(groups).map(([d, arr]) => `
           <div class="day">
-            <div class="day-h"><span>${fmtDate(d, { weekday: 'long', day: 'numeric', month: 'long' })}</span><span>${money(sum(arr, (e) => e.amount_uyu))}</span></div>
-            <ul class="list">${arr.map(expenseItem).join('')}</ul>
+            <div class="day-h"><span>${fmtDate(d, { weekday: 'long', day: 'numeric', month: 'long' })}</span><span>${money(sum(arr, sharedUyu))}</span></div>
+            <ul class="list">${arr.map((e) => expenseItem(e)).join('')}</ul>
           </div>`).join('')
       : emptyMsg('No hay gastos con estos filtros.')}`;
 
   $('#fMember').onclick = (ev) => { const b = ev.target.closest('button'); if (!b) return; state.filters.member = b.dataset.v; render(); };
   $('#fCat').onchange = (ev) => { state.filters.category = ev.target.value; render(); };
+  bindExpenseItems();
+}
+
+/** Control personal: lo personal de cada uno + lo que cargó en comunes + lo que aportó. */
+function viewMine(params) {
+  const admin = state.me.is_admin;
+  const who = admin && params.get('m') ? params.get('m') : state.me.id;
+  const wm = member(who);
+  const self = who === state.me.id;
+  const list = state.expenses.filter((e) => e.created_by === who && monthOf(e.spent_on) === state.month).sort(byDateDesc);
+  const personal = sum(list, personalUyu);
+  const loadedCommon = sum(list, sharedUyu);
+  const aportes = sum(state.contributions.filter((c) => c.member_id === who && c.month_id === state.month), (c) => c.amount);
+  const byCat = Object.entries(groupSum(list, (e) => e.category, personalUyu)).filter((x) => x[1] > 0).sort((a, b) => b[1] - a[1]);
+  const maxCat = Math.max(1, ...byCat.map((x) => x[1]));
+
+  view().innerHTML = `
+    <h1>${self ? 'Mis gastos' : 'Gastos de ' + esc(wm.name)} · ${monthLabel(state.month, { month: 'long' })}</h1>
+    ${movTabs(true)}
+    ${admin ? `<div class="chips" id="fWho">
+      ${state.members.map((m) => `<button data-v="${m.id}" class="${who === m.id ? 'sel' : ''}" style="--c:${m.color}">${esc(m.name)}</button>`).join('')}
+    </div>` : ''}
+    <div class="kpis">
+      <div class="kpi"><small>👤 Gastos personales</small><b>${money(personal)}</b></div>
+      <div class="kpi"><small>💵 ${self ? 'Aporté' : 'Aportó'} a la caja</small><b>${money(aportes)}</b></div>
+      <div class="kpi"><small>🏠 ${self ? 'Cargué' : 'Cargó'} en gastos comunes</small><b>${money(loadedCommon)}</b></div>
+      <div class="kpi"><small>Total de ${self ? 'mi' : 'su'} bolsillo</small><b>${money(personal + aportes)}</b></div>
+    </div>
+    <p class="muted small">"Total de ${self ? 'mi' : 'su'} bolsillo" = gastos personales + aportes a la caja. Lo cargado en comunes se paga con la caja.</p>
+    <section class="card">
+      <h2>Personales por categoría</h2>
+      ${byCat.length
+        ? byCat.map(([k, v]) => `<div class="bar-row"><span>${esc(cat(k).icon)} ${esc(k)}</span><div class="bar"><i style="width:${(v / maxCat) * 100}%;background:${cat(k).color}"></i></div><b>${money(v)}</b></div>`).join('')
+        : emptyMsg('Sin gastos personales este mes.')}
+    </section>
+    <section class="card">
+      <h2>Todo lo que ${self ? 'cargaste' : 'cargó'}</h2>
+      ${list.length ? `<ul class="list">${list.map((e) => expenseItem(e, 'mios')).join('')}</ul>` : emptyMsg(self ? 'Tocá ＋ y elegí 👤 Personal para controlar tus gastos.' : 'No cargó gastos este mes.')}
+    </section>
+    ${self ? '' : '<p class="muted small center">Los gastos personales solo los ven su dueño y la administradora.</p>'}`;
+
+  $('#fWho')?.addEventListener('click', (ev) => {
+    const b = ev.target.closest('button');
+    if (b) go('movimientos?vista=mios' + (b.dataset.v === state.me.id ? '' : '&m=' + b.dataset.v));
+  });
   bindExpenseItems();
 }
 
@@ -858,6 +1134,7 @@ function viewBalance() {
     if (!confirm(msg)) return;
     const { error } = await sb.from('months').update({ closed: true, closed_at: new Date().toISOString() }).eq('id', s.m);
     if (error) return toast(friendlyError(error), 'err');
+    notify('closed', s.m, { balance: round2(s.balance) });
     toast('Mes cerrado 🔒');
     await refresh();
   });
@@ -928,11 +1205,12 @@ function addContribution(s) {
     ev.preventDefault();
     const amount = Number($('#cAmount').value);
     if (!(amount > 0)) return toast('Ingresá un monto válido', 'err');
-    const { error } = await sb.from('contributions').insert({
+    const { data: newC, error } = await sb.from('contributions').insert({
       month_id: s.m, member_id: $('#cMember').value, kind: $('#cKind').value, amount,
       note: $('#cNote').value.trim() || null,
-    });
+    }).select();
     if (error) return toast(friendlyError(error), 'err');
+    if (newC?.[0]) notify('contribution', newC[0].id);
     close();
     toast('Aporte registrado 💵');
     await refresh();
@@ -946,23 +1224,25 @@ function viewAnalysis() {
   const m = state.month;
   const s = monthStats(m);
   const prev = monthStats(shiftMonth(m, -1));
-  const monthTotal = (x, catId) => sum(state.expenses.filter((e) => monthOf(e.spent_on) === x && (!catId || e.category === catId)), (e) => e.amount_uyu);
+  // Solo gastos comunes y lo que realmente se imputa a la caja
+  const commonExps = state.expenses.filter(isCommon);
+  const monthTotal = (x, catId) => sum(commonExps.filter((e) => monthOf(e.spent_on) === x && (!catId || e.category === catId)), sharedUyu);
 
   const last6 = Array.from({ length: 6 }, (_, i) => shiftMonth(m, i - 5));
   const totals6 = last6.map((x) => monthTotal(x));
-  const prev3 = [1, 2, 3].map((i) => shiftMonth(m, -i)).filter((x) => state.expenses.some((e) => monthOf(e.spent_on) === x));
+  const prev3 = [1, 2, 3].map((i) => shiftMonth(m, -i)).filter((x) => commonExps.some((e) => monthOf(e.spent_on) === x));
   const avg3 = (catId) => (prev3.length ? sum(prev3, (x) => monthTotal(x, catId)) / prev3.length : 0);
 
-  const catNow = groupSum(s.exps, (e) => e.category, (e) => e.amount_uyu);
+  const catNow = groupSum(s.exps, (e) => e.category, sharedUyu);
   const isCurrent = m === monthOf(todayStr());
   const dim = daysInMonth(m);
   const elapsed = isCurrent ? new Date().getDate() : dim;
   const perDay = s.spent / elapsed;
   const projection = isCurrent ? perDay * dim : s.spent;
   const diffPct = prev.spent > 0 ? ((s.spent - prev.spent) / prev.spent) * 100 : null;
-  const byMember = groupSum(s.exps, (e) => e.created_by, (e) => e.amount_uyu);
-  const biggest = [...s.exps].sort((a, b) => b.amount_uyu - a.amount_uyu)[0];
-  const usdTotal = sum(s.exps.filter((e) => e.currency === 'USD'), (e) => e.amount);
+  const byMember = groupSum(s.exps.filter((e) => sharedUyu(e) > 0), (e) => e.created_by, sharedUyu);
+  const biggest = [...s.exps].filter((e) => sharedUyu(e) > 0).sort((a, b) => sharedUyu(b) - sharedUyu(a))[0];
+  const usdTotal = round2(sum(s.exps.filter((e) => e.currency === 'USD'), (e) => sharedUyu(e) / Number(e.rate || 1)));
 
   // Alertas y observaciones
   const notes = [];
@@ -977,8 +1257,10 @@ function viewAnalysis() {
   } else if (isCurrent && s.quota > 0 && s.spent > 0) {
     notes.push({ t: 'ok', h: `👍 A este ritmo la caja alcanza: sobrarían unos <b>${money(available - projection)}</b>.` });
   }
-  if (biggest) notes.push({ t: 'info', h: `💸 Gasto más grande: <b>${money(biggest.amount_uyu)}</b> en ${esc(biggest.category)}${biggest.note ? ` (${esc(biggest.note)})` : ''}.` });
+  if (biggest) notes.push({ t: 'info', h: `💸 Gasto más grande: <b>${money(sharedUyu(biggest))}</b> en ${esc(biggest.category)}${biggest.note ? ` (${esc(biggest.note)})` : ''}.` });
   if (usdTotal) notes.push({ t: 'info', h: `💵 Este mes se gastaron <b>${fmtUSD.format(usdTotal)}</b> en dólares.` });
+  const excl = s.exps.filter((e) => e.excluded);
+  if (excl.length) notes.push({ t: 'info', h: `🚫 ${excl.length} gasto${excl.length === 1 ? '' : 's'} marcado${excl.length === 1 ? '' : 's'} como "No imputa" (${money(sum(excl, (e) => e.amount_uyu))}), no se cuenta${excl.length === 1 ? '' : 'n'}.` });
 
   const maxMember = Math.max(1, ...Object.values(byMember));
 
@@ -1026,7 +1308,7 @@ function viewAnalysis() {
         : emptyMsg('Sin datos.')}
     </section>`;
 
-  const catEntries = Object.keys(catNow).map(cat);
+  const catEntries = Object.keys(catNow).filter((k) => catNow[k] > 0).map(cat);
   makeChart('chCat', {
     type: 'doughnut',
     data: { labels: catEntries.map((c) => `${c.icon} ${c.id}`),
@@ -1112,13 +1394,20 @@ function viewFamily() {
     </section>` : ''}
 
     <section class="card">
+      <h2>🔔 Notificaciones</h2>
+      <p class="muted small" id="pushStatus">Revisando…</p>
+      <button class="btn primary block hidden" id="pushOn">Activar notificaciones en este celular</button>
+      <button class="btn ghost block hidden" id="pushOff">Desactivar en este celular</button>
+    </section>
+
+    <section class="card">
       <h2>📲 Instalar la app</h2>
       ${isStandalone() ? '<p>✅ Ya estás usando la app instalada.</p>' : `<p class="muted small">Para tenerla como una app más en el celular.</p><button class="btn primary block" data-install>Instalar en este celular</button>`}
       <button class="btn ghost block" id="share">🔗 Compartir enlace con la familia</button>
     </section>
 
     <button class="btn ghost block" id="logout">Cerrar sesión</button>
-    <p class="muted small center">Labaut · Juntos en casa · v1.1</p>`;
+    <p class="muted small center">Labaut · Juntos en casa · v2.0</p>`;
 
   $('#pName').value = me.name;
   let color = me.color;
@@ -1165,7 +1454,41 @@ function viewFamily() {
     if (navigator.share) { try { await navigator.share({ title: 'Labaut', text, url }); } catch { /* cancelado */ } }
     else { await navigator.clipboard?.writeText(url); toast('Enlace copiado 📋'); }
   };
-  $('#logout').onclick = async () => { await sb.auth.signOut(); };
+  $('#logout').onclick = async () => { await disablePush(false); await sb.auth.signOut(); };
+
+  // Estado de las notificaciones en este celular
+  (async () => {
+    const st = $('#pushStatus');
+    if (!st) return;
+    const show = (txt, on, off) => {
+      st.textContent = txt;
+      $('#pushOn')?.classList.toggle('hidden', !on);
+      $('#pushOff')?.classList.toggle('hidden', !off);
+    };
+    if (!pushSupported()) {
+      show(isIOS() && !isStandalone()
+        ? 'En iPhone primero instalá la app (Compartir → Agregar a inicio) y abrila desde el ícono.'
+        : 'Este navegador no permite notificaciones.', true, false);
+      return;
+    }
+    if (Notification.permission === 'denied') {
+      show('Las notificaciones están bloqueadas. Activalas en la configuración del celular (Notificaciones → Labaut o Chrome).', false, false);
+      return;
+    }
+    let active = false;
+    try {
+      const sub = await currentPushSub();
+      if (sub && Notification.permission === 'granted') {
+        const { data } = await sb.from('push_subscriptions').select('endpoint').eq('endpoint', sub.endpoint);
+        active = !!data?.length;
+      }
+    } catch { /* sin datos */ }
+    show(active
+      ? '✅ Activadas: te avisamos cuando alguien carga un gasto común o un aporte, y cuando se cierra el mes.'
+      : 'Recibí un aviso cuando alguien carga un gasto común o un aporte, y cuando se cierra el mes.', !active, active);
+  })();
+  $('#pushOn')?.addEventListener('click', async () => { if (await enablePush()) render(); });
+  $('#pushOff')?.addEventListener('click', async () => { await disablePush(true); toast('Notificaciones desactivadas'); render(); });
 }
 
 /* =====================================================================

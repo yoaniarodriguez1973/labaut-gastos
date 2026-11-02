@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Generar claves de notificaciones · Labaut</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 30px auto; padding: 0 16px; background: #FBF6EE; color: #2B2D42; }
+    h1 { color: #174E5A; font-size: 1.4rem; }
+    button { background: #E07A5F; color: #fff; border: 0; border-radius: 12px; padding: 12px 18px; font-size: 1rem; font-weight: 700; cursor: pointer; }
+    label { display: block; font-weight: 700; margin: 18px 0 6px; color: #174E5A; }
+    textarea { width: 100%; font-family: monospace; font-size: .9rem; padding: 10px; border-radius: 10px; border: 1.5px solid #EFE7DA; box-sizing: border-box; }
+    .warn { background: #FDECEA; color: #8E2A20; padding: 10px 12px; border-radius: 10px; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <h1>🔔 Claves para las notificaciones</h1>
+  <p>Este generador funciona solo dentro de tu navegador y no envía nada a internet. Usalo <b>una sola vez</b>.</p>
+  <button id="gen">Generar claves</button>
+  <div id="out" hidden>
+    <label>VAPID_PUBLIC_KEY</label>
+    <textarea id="pub" rows="3" readonly></textarea>
+    <label>VAPID_PRIVATE_KEY</label>
+    <textarea id="priv" rows="2" readonly></textarea>
+    <div class="warn">⚠️ Copiá las dos en Supabase → Edge Functions → Secrets. La privada no se la pases a nadie ni la pegues en el código.</div>
+  </div>
+  <script>
+    const b64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    document.getElementById('gen').onclick = async () => {
+      const kp = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+      const pub = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+      const jwk = await crypto.subtle.exportKey('jwk', kp.privateKey);
+      document.getElementById('pub').value = b64url(pub);
+      document.getElementById('priv').value = jwk.d;
+      document.getElementById('out').hidden = false;
+    };
+  </script>
+</body>
+</html>
