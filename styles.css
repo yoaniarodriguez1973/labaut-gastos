@@ -156,6 +156,8 @@ select:disabled { background-color: #F6F2EA; }
 .tag { font-size: .68rem; font-weight: 700; padding: 2px 7px; border-radius: 999px; background: #EEF4F7; color: var(--teal); white-space: nowrap; }
 .tag.personal { background: #F3ECFB; color: #6B3FA0; }
 .tag.excl { background: #FDECEA; color: var(--warn); }
+.tag.warn { background: #FFF4DC; color: #8A5A00; }
+.tag.ok { background: #EAF6EF; color: #1F5F3C; }
 .strike { text-decoration: line-through; color: var(--muted); }
 .item.excluded .info b, .item.excluded .ico { opacity: .55; }
 .seg a { padding: 8px 18px; border-radius: 999px; font-weight: 700; color: var(--muted); font-size: .95rem; }
@@ -171,6 +173,8 @@ select:disabled { background-color: #F6F2EA; }
 .mine-link { color: var(--text); }
 .mine-link span { color: var(--primary-d); font-weight: 700; font-size: .88rem; }
 #fWho { margin-bottom: 12px; }
+.info small.lines span { display: block; line-height: 1.45; }
+.amt .link { display: inline-block; margin-left: 8px; font-size: .8rem; }
 
 /* ---------- Botones ---------- */
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 0; border-radius: 14px; padding: 13px 18px;
