@@ -76,6 +76,13 @@ const isCommon = (e) => (e.scope || 'comun') === 'comun';
 const sharedUyu = (e) => Number(e.shared_uyu ?? e.amount_uyu) || 0;
 /** La parte personal del gasto ($UY): todo si es personal o "No imputa", o lo descontado del ticket. */
 const personalUyu = (e) => round2((Number(e.amount_uyu) || 0) - sharedUyu(e));
+// Pagado de bolsillo y reintegros
+const paidPocket = (e) => isCommon(e) && e.paid_from === 'bolsillo';
+/** Lo que se le acredita a quien pagó de su bolsillo (la parte común). */
+const pocketCredit = (e) => (paidPocket(e) ? sharedUyu(e) : 0);
+/** Lo que ya se le devolvió desde la caja. */
+const reimbUyu = (e) => Number(e.reimbursed_uyu) || 0;
+const isPendingReimb = (e) => paidPocket(e) && e.reimburse === 'reintegro' && !e.reimbursed_month && sharedUyu(e) > 0;
 const member = (id) => state.members.find((m) => m.id === id) || { name: '¿?', color: '#999999' };
 const initials = (name) => (name || '?').trim().charAt(0).toUpperCase();
 const isOpen = (m) => !state.months.find((x) => x.id === m)?.closed;
@@ -166,17 +173,58 @@ function monthStats(m) {
   const exps = common.filter((e) => monthOf(e.spent_on) === m);
   const conts = state.contributions.filter((c) => c.month_id === m);
   const opening = sum(state.contributions.filter((c) => c.month_id < m), (c) => c.amount)
-                - sum(common.filter((e) => monthOf(e.spent_on) < m), sharedUyu);
+                + sum(common.filter((e) => monthOf(e.spent_on) < m), pocketCredit)
+                - sum(common.filter((e) => monthOf(e.spent_on) < m), sharedUyu)
+                - sum(common.filter((e) => e.reimbursed_month && e.reimbursed_month < m), reimbUyu);
   const spent = sum(exps, sharedUyu);
   const contributed = sum(conts, (c) => c.amount);
-  const balance = opening + contributed - spent;
+  const pocket = sum(exps, pocketCredit);                                           // gastos comunes pagados de bolsillo
+  const reimbList = common.filter((e) => e.reimbursed_month === m);
+  const reimbs = sum(reimbList, reimbUyu);                                          // reintegros pagados este mes
+  const pendingList = common.filter((e) => isPendingReimb(e) && monthOf(e.spent_on) <= m);
+  const pending = sum(pendingList, sharedUyu);
+  const balance = opening + contributed + pocket - spent - reimbs;
   const adjTotal = sum(conts.filter((c) => c.kind === 'ajuste'), (c) => c.amount);
   const preAdj = balance - adjTotal;                         // saldo antes de los ajustes de fin de mes
   const share = preAdj < 0 ? round2(-preAdj / FAMILY_SIZE) : 0; // lo que debe poner cada uno si falta
   const row = state.months.find((x) => x.id === m) || null;
   return { m, exps, conts, opening, spent, contributed, balance, adjTotal, preAdj, share, row,
+           pocket, reimbs, reimbList, pending, pendingList,
            quota: Number(row?.quota || 0), closed: !!row?.closed };
 }
+
+/**
+ * Balance individual (acumulado desde el inicio hasta el mes m).
+ * Cada integrante paga 1/FAMILY_SIZE de los gastos comunes. Lo que aportó de más queda a su favor
+ * y lo que aportó de menos lo debe reponer. Los "Saldo inicial / otro ingreso" se reparten entre todos.
+ * La suma de los saldos individuales es igual al saldo de la caja.
+ */
+function memberStats(s) {
+  const m = s.m;
+  const common = state.expenses.filter(isCommon);
+  const prevFair = sum(common.filter((e) => monthOf(e.spent_on) < m), sharedUyu) / FAMILY_SIZE;
+  const incomeOf = (f) => sum(state.contributions.filter((c) => c.kind === 'inicial' && f(c.month_id)), (c) => c.amount) / FAMILY_SIZE;
+  const prevInc = incomeOf((x) => x < m);
+  const inc = incomeOf((x) => x === m);
+  const fair = s.spent / FAMILY_SIZE;
+  return state.members.map((mb) => {
+    const own = state.contributions.filter((c) => c.member_id === mb.id && c.kind !== 'inicial');
+    const mine = common.filter((e) => e.created_by === mb.id);
+    const prev = sum(own.filter((c) => c.month_id < m), (c) => c.amount) + prevInc - prevFair
+               + sum(mine.filter((e) => monthOf(e.spent_on) < m), pocketCredit)
+               - sum(mine.filter((e) => e.reimbursed_month && e.reimbursed_month < m), reimbUyu);
+    const cur = own.filter((c) => c.month_id === m);
+    const cuota = sum(cur.filter((c) => c.kind === 'cuota'), (c) => c.amount);
+    const ajuste = sum(cur.filter((c) => c.kind === 'ajuste'), (c) => c.amount);
+    const pocket = sum(mine.filter((e) => monthOf(e.spent_on) === m), pocketCredit);
+    const reimb = sum(mine.filter((e) => e.reimbursed_month === m), reimbUyu);
+    const pendingR = sum(mine.filter((e) => isPendingReimb(e) && monthOf(e.spent_on) <= m), sharedUyu);
+    const saldo = round2(prev + cuota + ajuste + pocket - reimb + inc - fair);
+    const personal = sum(state.expenses.filter((e) => e.created_by === mb.id && monthOf(e.spent_on) === m), personalUyu);
+    return { mb, prev: round2(prev), cuota, ajuste, pocket, reimb, pendingR, inc: round2(inc), fair: round2(fair), saldo, personal };
+  });
+}
+const signed = (v) => (v >= 0 ? '+' : '−') + money(Math.abs(v));
 
 async function receiptUrl(path) {
   if (state.receiptUrls[path]) return state.receiptUrls[path];
@@ -572,6 +620,11 @@ function expenseItem(e, mode = 'comun') {
   if (!isCommon(e)) tags.push('<span class="tag personal">👤 Personal</span>');
   if (e.excluded) tags.push('<span class="tag excl">🚫 No imputa</span>');
   if (isCommon(e) && !e.excluded && Number(e.personal_amount) > 0) tags.push(`<span class="tag">👤 ${money(personalUyu(e))} personal</span>`);
+  if (paidPocket(e) && !e.excluded) {
+    tags.push(e.reimbursed_month ? '<span class="tag ok">👛 ✅ Reintegrado</span>'
+      : isPendingReimb(e) ? '<span class="tag warn">👛 🔁 Reintegro pendiente</span>'
+      : '<span class="tag">👛 Bolsillo → fondo</span>');
+  }
 
   let amt;
   if (mode === 'mios') {
@@ -628,7 +681,7 @@ function viewHome() {
       <div class="big">${money(s.balance)}</div>
       <div class="row3">
         <div><small>Saldo anterior</small><b>${money(s.opening)}</b></div>
-        <div><small>Aportes</small><b>${money(s.contributed)}</b></div>
+        <div><small>Aportes</small><b>${money(s.contributed + s.pocket - s.reimbs)}</b></div>
         <div><small>Gastos</small><b>${money(s.spent)}</b></div>
       </div>
       ${s.closed ? '<div class="pill">🔒 Mes cerrado</div>' : ''}
@@ -665,7 +718,7 @@ async function openExpense(id) {
   const admin = state.me.is_admin;
   const open = isOpen(monthOf(e.spent_on));
   const common = isCommon(e);
-  const canModify = mine && (!common || open);   // los personales se pueden tocar aunque el mes esté cerrado
+  const canModify = (mine || admin) && (!common || open);   // los personales se pueden tocar aunque el mes esté cerrado
   const hasSplit = common && Number(e.personal_amount) > 0;
   const by = e.excluded_by ? member(e.excluded_by).name : '';
   const close = openModal(`
@@ -682,16 +735,23 @@ async function openExpense(id) {
         <dt>Parte personal</dt><dd>${money(personalUyu(e))}${e.excluded ? '' : ` (de ${esc(m.name)})`}</dd>
         <dt>A la caja</dt><dd><b>${money(sharedUyu(e))}</b></dd>` : ''}
       <dt>Fecha</dt><dd>${fmtDate(e.spent_on, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</dd>
+      ${common ? `<dt>Pagado con</dt><dd>${paidPocket(e)
+        ? `👛 Bolsillo de ${esc(m.name)} · ${e.reimbursed_month ? `✅ reintegrado ${money(reimbUyu(e))}` : e.reimburse === 'reintegro' ? '🔁 pide reintegro' : '🎁 queda para el fondo'}`
+        : '💰 Plata de la caja'}</dd>` : ''}
       <dt>Registrado por</dt><dd><span class="dot" style="background:${m.color}"></span>${esc(m.name)}</dd>
       ${e.note ? `<dt>Nota</dt><dd>${esc(e.note)}</dd>` : ''}
     </dl>
     ${e.receipt_path ? '<div class="receipt" id="receiptBox">Cargando ticket…</div>' : ''}
     ${canModify ? '<div class="actions"><button class="btn ghost" id="btnEdit">✏️ Editar</button><button class="btn danger" id="btnDel">🗑️ Borrar</button></div>' : ''}
-    ${mine && !canModify ? '<p class="muted">🔒 El mes está cerrado; no se puede modificar.</p>' : ''}
-    ${!mine ? `<p class="muted small">Solo ${esc(m.name)} puede editar o borrar este gasto.</p>` : ''}
+    ${(mine || admin) && !canModify ? '<p class="muted">🔒 El mes está cerrado; no se puede modificar.</p>' : ''}
+    ${!mine && !admin ? `<p class="muted small">Solo ${esc(m.name)} puede editar o borrar este gasto.</p>` : ''}
+    ${!mine && admin && canModify ? `<p class="muted small">Como administradora podés editar o borrar este gasto de ${esc(m.name)}.</p>` : ''}
     ${admin && common && open ? (e.excluded
       ? '<button class="btn ghost block" id="btnInclude">↩️ Volver a imputar a la caja</button>'
-      : '<button class="btn ghost block" id="btnExclude">🚫 Marcar "No imputa"</button>') : ''}`);
+      : '<button class="btn ghost block" id="btnExclude">🚫 Marcar "No imputa"</button>') : ''}
+    ${admin && isPendingReimb(e) ? `<button class="btn primary block" id="btnReimb">💸 Reintegrar ${money(sharedUyu(e))} a ${esc(m.name)}</button>` : ''}`);
+
+  $('#btnReimb')?.addEventListener('click', async () => { if (await setReimbursed(e.id, true)) close(); });
 
   $('#btnExclude')?.addEventListener('click', async () => {
     const reason = prompt('¿Por qué no imputa? (opcional)\nEj: "Es un gasto personal"', '');
@@ -741,12 +801,14 @@ function defaultDate() {
 function viewExpenseForm(params) {
   const id = params.get('id');
   const e = id ? state.expenses.find((x) => x.id === id) : null;
-  if (id && (!e || e.created_by !== state.me.id)) { toast('No podés editar ese gasto', 'err'); go('movimientos'); return; }
+  if (id && (!e || (e.created_by !== state.me.id && !state.me.is_admin))) { toast('No podés editar ese gasto', 'err'); go('movimientos'); return; }
+  const othersExp = e && e.created_by !== state.me.id;
 
   const f = {
     amount: e?.amount ?? '', currency: e?.currency ?? 'UYU', rate: e && e.currency === 'USD' ? e.rate : '',
     category: e?.category ?? '', spent_on: e?.spent_on ?? defaultDate(), note: e?.note ?? '',
     scope: e?.scope ?? 'comun', personal: Number(e?.personal_amount) > 0 ? e.personal_amount : '',
+    paid_from: e?.paid_from ?? 'caja', reimburse: e?.reimburse ?? 'reintegro',
   };
   let newPhoto = null;
   let removePhoto = false;
@@ -756,7 +818,7 @@ function viewExpenseForm(params) {
 
   view().innerHTML = `
     <form id="expForm" class="form">
-      <h1>${e ? 'Editar gasto' : 'Nuevo gasto'}</h1>
+      <h1>${e ? (othersExp ? `Editar gasto de ${esc(member(e.created_by).name)}` : 'Editar gasto') : 'Nuevo gasto'}</h1>
       <div class="amount-box">
         <div class="seg" id="curSeg">
           <button type="button" data-cur="UYU">$ UY</button>
@@ -782,6 +844,22 @@ function viewExpenseForm(params) {
         <div id="personalRow" class="hidden">
           <input id="personal" type="number" inputmode="decimal" step="0.01" min="0.01" placeholder="¿Cuánto es lo personal?">
           <div id="splitPreview" class="split-preview"></div>
+        </div>
+      </div>
+      <div id="paidBox" class="split-box">
+        <label class="lbl">¿Con qué se pagó?</label>
+        <div class="seg scope-seg" id="paidSeg">
+          <button type="button" data-paid="caja">💰 Plata de la caja</button>
+          <button type="button" data-paid="bolsillo">👛 ${othersExp ? 'Su' : 'Mi'} bolsillo</button>
+        </div>
+        <div id="reimbBox" class="hidden">
+          <label class="lbl">¿Qué hacemos con esa plata?</label>
+          <div class="seg scope-seg" id="reimbSeg">
+            <button type="button" data-reimb="reintegro">🔁 Reintegrar</button>
+            <button type="button" data-reimb="fondo">🎁 Queda para el fondo</button>
+          </div>
+          <small class="muted" id="reimbHelp"></small>
+          ${e?.reimbursed_month ? `<div class="alert ok">✅ Ya se reintegraron ${money(reimbUyu(e))} el ${new Date(e.reimbursed_at).toLocaleDateString('es-UY')}.</div>` : ''}
         </div>
       </div>
 
@@ -837,6 +915,7 @@ function viewExpenseForm(params) {
     f.scope = sc;
     $$('#scopeSeg button').forEach((b) => b.classList.toggle('sel', b.dataset.scope === sc));
     $('#splitBox').classList.toggle('hidden', sc !== 'comun');
+    $('#paidBox').classList.toggle('hidden', sc !== 'comun');
     $('#scopeHelp').textContent = sc === 'comun'
       ? 'Entra en la caja común y lo ven todos.'
       : 'Solo para tu control: no toca la caja. Lo ven vos y la administradora.';
@@ -852,6 +931,22 @@ function viewExpenseForm(params) {
   $('#hasPersonal').checked = !!f.personal;
   $('#personalRow').classList.toggle('hidden', !f.personal);
   setScope(f.scope);
+  const setPaid = (p) => {
+    f.paid_from = p;
+    $$('#paidSeg button').forEach((b) => b.classList.toggle('sel', b.dataset.paid === p));
+    $('#reimbBox').classList.toggle('hidden', p !== 'bolsillo');
+  };
+  const setReimb = (r) => {
+    f.reimburse = r;
+    $$('#reimbSeg button').forEach((b) => b.classList.toggle('sel', b.dataset.reimb === r));
+    $('#reimbHelp').textContent = r === 'reintegro'
+      ? 'La administradora te lo devuelve desde la caja. Hasta entonces queda a tu favor en el balance.'
+      : 'No se devuelve: cuenta como un aporte tuyo a la caja (queda a tu favor en el balance).';
+  };
+  $('#paidSeg').onclick = (ev) => { const b = ev.target.closest('button'); if (b) setPaid(b.dataset.paid); };
+  $('#reimbSeg').onclick = (ev) => { const b = ev.target.closest('button'); if (b) setReimb(b.dataset.reimb); };
+  setPaid(f.paid_from);
+  setReimb(f.reimburse);
   const setCurrency = async (cur) => {
     f.currency = cur;
     $$('#curSeg button').forEach((b) => b.classList.toggle('sel', b.dataset.cur === cur));
@@ -923,7 +1018,9 @@ function viewExpenseForm(params) {
         receipt_path = null;
       }
       const payload = { amount, currency: f.currency, rate, category: f.category, spent_on,
-                        note: $('#note').value.trim() || null, receipt_path, scope: f.scope, personal_amount };
+                        note: $('#note').value.trim() || null, receipt_path, scope: f.scope, personal_amount,
+                        paid_from: f.scope === 'comun' ? f.paid_from : 'caja',
+                        reimburse: f.scope === 'comun' && f.paid_from === 'bolsillo' ? f.reimburse : 'fondo' };
       const q = e ? sb.from('expenses').update(payload).eq('id', e.id).select()
                   : sb.from('expenses').insert(payload).select();
       const { data, error } = await q;
@@ -998,6 +1095,9 @@ function viewMine(params) {
   const list = state.expenses.filter((e) => e.created_by === who && monthOf(e.spent_on) === state.month).sort(byDateDesc);
   const personal = sum(list, personalUyu);
   const loadedCommon = sum(list, sharedUyu);
+  const pocketNet = sum(list, pocketCredit)
+    - sum(state.expenses.filter((e) => e.created_by === who && e.reimbursed_month === state.month), reimbUyu);
+  const pendingMine = sum(state.expenses.filter((e) => e.created_by === who && isPendingReimb(e)), sharedUyu);
   const aportes = sum(state.contributions.filter((c) => c.member_id === who && c.month_id === state.month), (c) => c.amount);
   const byCat = Object.entries(groupSum(list, (e) => e.category, personalUyu)).filter((x) => x[1] > 0).sort((a, b) => b[1] - a[1]);
   const maxCat = Math.max(1, ...byCat.map((x) => x[1]));
@@ -1011,10 +1111,11 @@ function viewMine(params) {
     <div class="kpis">
       <div class="kpi"><small>👤 Gastos personales</small><b>${money(personal)}</b></div>
       <div class="kpi"><small>💵 ${self ? 'Aporté' : 'Aportó'} a la caja</small><b>${money(aportes)}</b></div>
-      <div class="kpi"><small>🏠 ${self ? 'Cargué' : 'Cargó'} en gastos comunes</small><b>${money(loadedCommon)}</b></div>
-      <div class="kpi"><small>Total de ${self ? 'mi' : 'su'} bolsillo</small><b>${money(personal + aportes)}</b></div>
+      <div class="kpi"><small>👛 Comunes ${self ? 'pagados de mi' : 'pagados de su'} bolsillo</small><b>${money(pocketNet)}</b>${pendingMine ? `<small>🔁 pendiente ${money(pendingMine)}</small>` : ''}</div>
+      <div class="kpi"><small>Total de ${self ? 'mi' : 'su'} bolsillo</small><b>${money(personal + aportes + pocketNet)}</b></div>
     </div>
-    <p class="muted small">"Total de ${self ? 'mi' : 'su'} bolsillo" = gastos personales + aportes a la caja. Lo cargado en comunes se paga con la caja.</p>
+    <p class="muted small">"Total de ${self ? 'mi' : 'su'} bolsillo" = gastos personales + aportes a la caja + gastos comunes pagados de bolsillo (menos lo reintegrado).
+      ${loadedCommon ? `En total ${self ? 'cargaste' : 'cargó'} ${money(loadedCommon)} en gastos comunes.` : ''}</p>
     <section class="card">
       <h2>Personales por categoría</h2>
       ${byCat.length
@@ -1043,28 +1144,39 @@ function viewBalance() {
   const nextLabel = monthLabel(shiftMonth(s.m, 1), { month: 'long' });
 
   let status;
-  if (s.preAdj < 0 && s.balance < 0) {
-    status = `<div class="alert warn">Faltan <b>${money(-s.preAdj)}</b> para cubrir los gastos.<br>
-      Cada uno debe aportar <b>${money(s.share)}</b> como <i>"Ajuste fin de mes"</i>.
-      ${s.adjTotal ? `<br>Ya se aportaron ${money(s.adjTotal)} · falta ${money(-s.balance)}.` : ''}</div>`;
-  } else if (s.preAdj < 0) {
-    status = '<div class="alert ok">✅ El faltante del mes ya fue cubierto por todos. ¡Bien!</div>';
-  } else if (s.balance > 0) {
-    status = `<div class="alert ok">Sobran <b>${money(s.balance)}</b> → pasan a ${nextLabel}. 🎉</div>`;
+  const ms = memberStats(s);
+  const debtors = ms.filter((x) => x.saldo < -0.5);
+  if (s.balance < -0.5) {
+    status = `<div class="alert warn">Faltan <b>${money(-s.balance)}</b> en la caja para cubrir los gastos.<br>
+      Cada uno repone según su balance individual${debtors.length ? ': ' + debtors.map((x) => `<b>${esc(x.mb.name)} ${money(-x.saldo)}</b>`).join(', ') : ''}.
+      <br><small>Se registra como <i>"Ajuste fin de mes"</i>.</small></div>`;
+  } else if (s.balance > 0.5) {
+    status = `<div class="alert ok">Sobran <b>${money(s.balance)}</b> → pasan a ${nextLabel}. 🎉
+      ${debtors.length ? `<br><small>Igual hay quien quedó en contra: ${debtors.map((x) => `${esc(x.mb.name)} ${money(-x.saldo)}`).join(', ')}.</small>` : ''}</div>`;
   } else {
     status = '<div class="alert ok">La caja está exactamente en cero. ✅</div>';
   }
 
-  const perMember = state.members.map((m) => {
-    const cs = s.conts.filter((c) => c.member_id === m.id);
-    const cuota = sum(cs.filter((c) => c.kind === 'cuota'), (c) => c.amount);
-    const ajuste = sum(cs.filter((c) => c.kind === 'ajuste'), (c) => c.amount);
-    const otros = sum(cs.filter((c) => c.kind === 'inicial'), (c) => c.amount);
-    const quotaTxt = s.quota > 0 ? (cuota >= s.quota ? '✅' : `⏳ falta ${money(s.quota - cuota)}`) : '';
-    const adjTxt = s.share > 0 ? (ajuste >= s.share ? ' · Ajuste ✅' : ` · Ajuste ⏳ falta ${money(s.share - ajuste)}`) : '';
+  const perMember = ms.map((x) => {
+    const showPersonal = x.mb.id === state.me.id || admin;
+    const quotaTxt = s.quota > 0 ? (x.cuota >= s.quota ? ' ✅' : ` · cuota ⏳ falta ${money(s.quota - x.cuota)}`) : '';
+    const right = x.saldo < -0.5
+      ? `<b class="neg">Debe ${money(-x.saldo)}</b><small>a reponer</small>`
+      : x.saldo > 0.5 ? `<b class="pos">A favor ${money(x.saldo)}</b><small>pasa al mes siguiente</small>` : '<b class="pos">Al día ✅</b>';
     return `<li class="item">
-      <div class="avatar sm" style="background:${m.color}">${initials(m.name)}</div>
-      <div class="info"><b>${esc(m.name)}</b><small>Cuota: ${money(cuota)} ${quotaTxt}${adjTxt}${otros ? ` · Otros: ${money(otros)}` : ''}</small></div>
+      <div class="avatar sm" style="background:${x.mb.color}">${initials(x.mb.name)}</div>
+      <div class="info"><b>${esc(x.mb.name)}</b>
+        <small class="lines">
+          <span>Aportó ${money(x.cuota + x.ajuste)}${x.ajuste ? ` (cuota ${money(x.cuota)} + ajuste ${money(x.ajuste)})` : ''}${quotaTxt}</span>
+          <span>Su parte de los gastos comunes: ${money(x.fair)}</span>
+          ${x.pocket ? `<span>👛 Pagó comunes de su bolsillo: +${money(x.pocket)}</span>` : ''}
+          ${x.reimb ? `<span>💸 Se le reintegró: −${money(x.reimb)}</span>` : ''}
+          ${x.pendingR ? `<span>🔁 Reintegro pendiente: ${money(x.pendingR)}</span>` : ''}
+          ${Math.abs(x.prev) > 0.5 ? `<span>Saldo de meses anteriores: ${signed(x.prev)}</span>` : ''}
+          ${x.inc ? `<span>Su parte de otros ingresos: +${money(x.inc)}</span>` : ''}
+          ${showPersonal && x.personal ? `<span>👤 Gastos personales (aparte): ${money(x.personal)}</span>` : ''}
+        </small></div>
+      <div class="amt">${right}</div>
     </li>`;
   }).join('');
 
@@ -1082,19 +1194,46 @@ function viewBalance() {
       <table class="tbl">
         <tr><td>Saldo del mes anterior</td><td>${money(s.opening)}</td></tr>
         <tr><td>+ Aportes del mes</td><td>${money(s.contributed)}</td></tr>
-        <tr><td>− Gastos del mes</td><td>${money(s.spent)}</td></tr>
+        ${s.pocket ? `<tr><td>+ Gastos comunes pagados de bolsillo</td><td>${money(s.pocket)}</td></tr>` : ''}
+        <tr><td>− Gastos comunes del mes</td><td>${money(s.spent)}</td></tr>
+        ${s.reimbs ? `<tr><td>− Reintegros pagados</td><td>${money(s.reimbs)}</td></tr>` : ''}
         <tr class="tot"><td>= Saldo actual</td><td class="${s.balance < 0 ? 'neg' : 'pos'}">${money(s.balance)}</td></tr>
       </table>
+      ${s.pocket ? '<p class="muted small">Lo pagado de bolsillo cuenta como gasto común y, a la vez, como aporte de quien lo pagó.</p>' : ''}
+      ${s.pending ? `<div class="alert info">🔁 De este saldo, <b>${money(s.pending)}</b> están pendientes de reintegrar.
+        Disponible real: <b>${money(s.balance - s.pending)}</b>.</div>` : ''}
       ${status}
     </section>
 
     <section class="card">
-      <h2>Aportes por persona</h2>
+      <h2>Balance por persona</h2>
+      <p class="muted small">Cada uno paga 1/${FAMILY_SIZE} de los gastos comunes (${money(s.spent / FAMILY_SIZE)} este mes). Lo que aportó de más queda a su favor; lo que falta, lo repone.</p>
       <ul class="list">${perMember}</ul>
       ${state.members.length < FAMILY_SIZE ? `<p class="muted small">Faltan ${FAMILY_SIZE - state.members.length} integrante(s) por crear su cuenta.</p>` : ''}
       ${!s.closed && s.row ? '<button class="btn primary block" id="addContrib">💵 Registrar aporte</button>' : ''}
       ${!s.row ? '<p class="muted small">Para registrar aportes primero hay que definir la cuota del mes.</p>' : ''}
     </section>
+
+    ${s.pendingList.length || s.reimbList.length ? `<section class="card">
+      <h2>🔁 Reintegros</h2>
+      <ul class="list">
+        ${s.pendingList.map((e) => `<li class="item">
+          <div class="ico">👛</div>
+          <div class="info"><b>${esc(member(e.created_by).name)} · ${esc(e.note || e.category)}</b>
+            <small>${fmtDate(e.spent_on)} · pendiente</small></div>
+          <div class="amt"><b>${money(sharedUyu(e))}</b>
+            ${admin ? `<button class="link" data-reimb="${e.id}">💸 Reintegrar</button>` : ''}</div>
+        </li>`).join('')}
+        ${s.reimbList.map((e) => `<li class="item">
+          <div class="ico">✅</div>
+          <div class="info"><b>${esc(member(e.created_by).name)} · ${esc(e.note || e.category)}</b>
+            <small>Reintegrado el ${new Date(e.reimbursed_at).toLocaleDateString('es-UY')}</small></div>
+          <div class="amt"><b>${money(reimbUyu(e))}</b>
+            ${admin && !s.closed ? `<button class="link danger" data-unreimb="${e.id}">Deshacer</button>` : ''}</div>
+        </li>`).join('')}
+      </ul>
+      ${admin && s.pendingList.length ? '<p class="muted small">Tocá "Reintegrar" cuando le devuelvas la plata desde la caja. Se registra en el mes actual.</p>' : ''}
+    </section>` : ''}
 
     <section class="card">
       <h2>Movimientos de la caja</h2>
@@ -1105,6 +1244,7 @@ function viewBalance() {
               <div class="info"><b>${esc(member(c.member_id).name)} · ${KIND[c.kind]}</b>
                 <small>${new Date(c.created_at).toLocaleDateString('es-UY')}${c.note ? ' · ' + esc(c.note) : ''}</small></div>
               <div class="amt"><b>${money(c.amount)}</b>
+                ${admin && !s.closed ? `<button class="link" data-editc="${c.id}">Editar</button>` : ''}
                 ${(c.created_by === state.me.id || admin) && !s.closed ? `<button class="link danger" data-delc="${c.id}">Borrar</button>` : ''}</div>
             </li>`).join('')}</ul>`
         : emptyMsg('Sin aportes todavía.')}
@@ -1120,6 +1260,9 @@ function viewBalance() {
 
   $('#editQuota')?.addEventListener('click', () => editQuota(s));
   $('#addContrib')?.addEventListener('click', () => addContribution(s));
+  $$('[data-editc]').forEach((b) => (b.onclick = () => addContribution(s, s.conts.find((c) => c.id === b.dataset.editc))));
+  $$('[data-reimb]').forEach((b) => (b.onclick = () => setReimbursed(b.dataset.reimb, true)));
+  $$('[data-unreimb]').forEach((b) => (b.onclick = () => setReimbursed(b.dataset.unreimb, false)));
   $$('[data-delc]').forEach((b) => (b.onclick = async () => {
     if (!confirm('¿Borrar este aporte?')) return;
     const { data, error } = await sb.from('contributions').delete().eq('id', b.dataset.delc).select();
@@ -1147,6 +1290,23 @@ function viewBalance() {
   });
 }
 
+/** Registrar (o deshacer) que la administradora devolvió desde la caja un gasto pagado de bolsillo. */
+async function setReimbursed(id, done) {
+  const e = state.expenses.find((x) => x.id === id);
+  if (!e) return false;
+  const who = member(e.created_by).name;
+  const ok = done
+    ? confirm(`¿Le devolviste ${money(sharedUyu(e))} a ${who} desde la caja?\nSe registra como salida de la caja en ${monthLabel(monthOf(todayStr()))}.`)
+    : confirm(`¿Deshacer el reintegro de ${money(reimbUyu(e))} a ${who}?`);
+  if (!ok) return false;
+  const { error } = await sb.rpc('set_expense_reimbursed', { p_id: id, p_done: done });
+  if (error) { toast(friendlyError(error), 'err'); return false; }
+  if (done) notify('reimbursed', id);
+  toast(done ? 'Reintegro registrado 💸' : 'Reintegro deshecho');
+  await refresh();
+  return true;
+}
+
 function editQuota(s) {
   const suggestion = s.row ? s.quota : Number(state.months.filter((x) => x.id < s.m).slice(-1)[0]?.quota || 0);
   const close = openModal(`<h2>Cuota de ${monthLabel(s.m)}</h2>
@@ -1168,51 +1328,74 @@ function editQuota(s) {
   };
 }
 
-function addContribution(s) {
+/** Registrar un aporte nuevo, o editar uno existente (c) si sos la administradora. */
+function addContribution(s, c = null) {
   if (!s.row) { toast('Primero hay que definir la cuota del mes', 'err'); return; }
   const admin = state.me.is_admin;
-  const paid = (id, kind) => sum(s.conts.filter((c) => c.member_id === id && c.kind === kind), (c) => c.amount);
+  if (c && !admin) return;
+  const paid = (id, kind) => sum(s.conts.filter((x) => x.member_id === id && x.kind === kind && x.id !== c?.id), (x) => x.amount);
+  const saldoOf = (id) => memberStats(s).find((x) => x.mb.id === id)?.saldo ?? 0;
   const who = admin ? state.members : [state.me];
-  const close = openModal(`<h2>💵 Registrar aporte</h2>
+  const sel = c?.member_id || state.me.id;
+  const defKind = c?.kind || (s.balance < 0 && saldoOf(sel) < 0 ? 'ajuste' : 'cuota');
+  const close = openModal(`<h2>${c ? '✏️ Editar aporte' : '💵 Registrar aporte'}</h2>
     <form id="cForm" class="form">
       <label class="lbl">¿Quién aporta?</label>
       <select id="cMember" ${admin ? '' : 'disabled'}>
-        ${who.map((m) => `<option value="${m.id}" ${m.id === state.me.id ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}
+        ${who.map((m) => `<option value="${m.id}" ${m.id === sel ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}
       </select>
       <label class="lbl">Tipo</label>
       <select id="cKind">
-        <option value="cuota">💵 Cuota mensual</option>
-        <option value="ajuste" ${s.share > 0 && s.balance < 0 ? 'selected' : ''}>⚖️ Ajuste fin de mes</option>
-        ${admin ? '<option value="inicial">🏦 Saldo inicial / otro ingreso</option>' : ''}
+        <option value="cuota" ${defKind === 'cuota' ? 'selected' : ''}>💵 Cuota mensual</option>
+        <option value="ajuste" ${defKind === 'ajuste' ? 'selected' : ''}>⚖️ Ajuste fin de mes</option>
+        ${admin ? `<option value="inicial" ${defKind === 'inicial' ? 'selected' : ''}>🏦 Saldo inicial / otro ingreso (se reparte entre todos)</option>` : ''}
       </select>
       <label class="lbl">Monto ($UY)</label>
       <input id="cAmount" type="number" inputmode="decimal" step="0.01" min="0.01" required>
+      <small class="muted" id="cHint"></small>
       <label class="lbl">Nota (opcional)</label>
       <input id="cNote" type="text" maxlength="80">
-      <button class="btn primary block">Guardar aporte</button>
+      <button class="btn primary block">${c ? 'Guardar cambios' : 'Guardar aporte'}</button>
     </form>`);
   const suggest = () => {
     const k = $('#cKind').value, id = $('#cMember').value;
-    let v = '';
+    let v = '', hint = '';
     if (k === 'cuota') v = Math.max(s.quota - paid(id, 'cuota'), 0) || s.quota || '';
-    if (k === 'ajuste') v = Math.max(round2(s.share - paid(id, 'ajuste')), 0) || '';
+    if (k === 'ajuste') {
+      const debe = Math.max(round2(-saldoOf(id)), 0);
+      v = debe || '';
+      hint = debe ? `Según su balance individual debe reponer ${money(debe)}.` : 'Según su balance individual no debe nada este mes.';
+    }
+    if (k === 'inicial') hint = `Cuenta como ingreso de todos: a cada uno le suma 1/${FAMILY_SIZE} en su balance.`;
     $('#cAmount').value = v;
+    $('#cHint').textContent = hint;
   };
   $('#cKind').onchange = suggest;
   $('#cMember').onchange = suggest;
-  suggest();
+  if (c) {
+    $('#cAmount').value = c.amount;
+    $('#cNote').value = c.note || '';
+  } else {
+    suggest();
+  }
   $('#cForm').onsubmit = async (ev) => {
     ev.preventDefault();
     const amount = Number($('#cAmount').value);
     if (!(amount > 0)) return toast('Ingresá un monto válido', 'err');
-    const { data: newC, error } = await sb.from('contributions').insert({
-      month_id: s.m, member_id: $('#cMember').value, kind: $('#cKind').value, amount,
-      note: $('#cNote').value.trim() || null,
-    }).select();
-    if (error) return toast(friendlyError(error), 'err');
-    if (newC?.[0]) notify('contribution', newC[0].id);
-    close();
-    toast('Aporte registrado 💵');
+    const row = { member_id: $('#cMember').value, kind: $('#cKind').value, amount, note: $('#cNote').value.trim() || null };
+    if (c) {
+      const { data, error } = await sb.from('contributions').update(row).eq('id', c.id).select();
+      if (error) return toast(friendlyError(error), 'err');
+      if (!data?.length) return toast('No se pudo editar (¿falta ejecutar v3_admin_edita.sql?)', 'err');
+      close();
+      toast('Aporte actualizado ✅');
+    } else {
+      const { data: newC, error } = await sb.from('contributions').insert({ month_id: s.m, ...row }).select();
+      if (error) return toast(friendlyError(error), 'err');
+      if (newC?.[0]) notify('contribution', newC[0].id);
+      close();
+      toast('Aporte registrado 💵');
+    }
     await refresh();
   };
 }
@@ -1407,7 +1590,7 @@ function viewFamily() {
     </section>
 
     <button class="btn ghost block" id="logout">Cerrar sesión</button>
-    <p class="muted small center">Labaut · Juntos en casa · v2.0</p>`;
+    <p class="muted small center">Labaut · Juntos en casa · v2.2</p>`;
 
   $('#pName').value = me.name;
   let color = me.color;
