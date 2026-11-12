@@ -71,7 +71,8 @@ Deno.serve(async (req) => {
       to = others;
       msg = {
         title: '🛒 Nuevo gasto común',
-        body: `${me.name}: ${money(e.shared_uyu)} en ${e.category}${e.note ? ' · ' + e.note : ''}`,
+        body: `${me.name}: ${money(e.shared_uyu)} en ${e.category}${e.note ? ' · ' + e.note : ''}` +
+              (e.paid_from === 'bolsillo' ? (e.reimburse === 'reintegro' ? ' · 👛 pagó de su bolsillo, pide reintegro' : ' · 👛 pagó de su bolsillo (queda para el fondo)') : ''),
         url: './#/movimientos',
         tag: 'exp-' + e.id,
       };
@@ -96,6 +97,17 @@ Deno.serve(async (req) => {
               `${e.excluded_reason ? ' — ' + e.excluded_reason : ''}. Pasa a tus gastos personales.`,
         url: './#/movimientos?vista=mios',
         tag: 'exc-' + e.id,
+      };
+    } else if (type === 'reimbursed') {
+      if (!me.is_admin) return json({ error: 'Solo la administradora' }, 403);
+      const { data: e } = await admin.from('expenses').select('*').eq('id', id).maybeSingle();
+      if (!e || !e.reimbursed_month || e.created_by === me.id) return json({ skipped: true });
+      to = [e.created_by];
+      msg = {
+        title: '💸 Te reintegraron un gasto',
+        body: `${me.name} te devolvió ${money(e.reimbursed_uyu)} de la caja por ${e.category}${e.note ? ' (' + e.note + ')' : ''}.`,
+        url: './#/balance',
+        tag: 'rei-' + e.id,
       };
     } else if (type === 'closed') {
       if (!me.is_admin) return json({ error: 'Solo la administradora' }, 403);
